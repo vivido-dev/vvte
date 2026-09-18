@@ -89,9 +89,7 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
                 State::Ground => i += self.advance_ground(performer, &bytes[i..]),
                 _ => {
                     // Inlining it results in worse codegen.
-                    let byte = bytes[i];
-                    self.change_state(performer, byte);
-                    i += 1;
+                    i += self.change_state(performer, &bytes[i..]);
                 },
             }
         }
@@ -126,9 +124,7 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
                 State::Ground => i += self.advance_ground(performer, &bytes[i..]),
                 _ => {
                     // Inlining it results in worse codegen.
-                    let byte = bytes[i];
-                    self.change_state(performer, byte);
-                    i += 1;
+                    i += self.change_state(performer, &bytes[i..]);
                 },
             }
         }
@@ -136,8 +132,13 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
         i
     }
 
+    /// Advance a non-ground state, returning the number of bytes consumed.
+    ///
+    /// Every state but `OscString` consumes exactly the one byte it is given; OSC payloads are
+    /// appended in bulk, so that arm reports its own run length.
     #[inline(always)]
-    fn change_state<P: Perform>(&mut self, performer: &mut P, byte: u8) {
+    fn change_state<P: Perform>(&mut self, performer: &mut P, bytes: &[u8]) -> usize {
+        let byte = bytes[0];
         match self.state {
             State::CsiEntry => self.advance_csi_entry(performer, byte),
             State::CsiIgnore => self.advance_csi_ignore(performer, byte),
@@ -150,10 +151,11 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
             State::DcsPassthrough => self.advance_dcs_passthrough(performer, byte),
             State::Escape => self.advance_esc(performer, byte),
             State::EscapeIntermediate => self.advance_esc_intermediate(performer, byte),
-            State::OscString => self.advance_osc_string(performer, byte),
+            State::OscString => return self.advance_osc_string_bulk(performer, bytes),
             State::SosPmApcString => self.anywhere(performer, byte),
             State::Ground => unreachable!(),
         }
+        1
     }
 
     #[inline(always)]
@@ -396,6 +398,31 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
             0x3B => self.action_osc_put_param(),
             _ => self.action_osc_put(byte),
         }
+    }
+
+    /// Advance an OSC string payload in bulk.
+    ///
+    /// Payload bytes that carry no meaning for the OSC state machine — anything at or above
+    /// `0x20` except the `;` parameter separator — are appended to the raw buffer in one step.
+    /// The first significant byte is routed through the regular per-byte state handler, which
+    /// owns termination (BEL, CAN, SUB, ESC) and parameter splitting.
+    ///
+    /// Skipping [`Perform::terminated`] for the bulk run is sound: it can only be set by a CSI
+    /// dispatch, and from `OscString` only the escape byte can lead there, which always goes
+    /// through the per-byte handler before the loop re-checks it.
+    ///
+    /// Kept out of line so the bulk scan does not enlarge the hot per-byte dispatch.
+    #[inline(never)]
+    fn advance_osc_string_bulk<P: Perform>(&mut self, performer: &mut P, bytes: &[u8]) -> usize {
+        let run = bytes.iter().position(|&b| b < 0x20 || b == b';').unwrap_or(bytes.len());
+        if run > 0 {
+            self.osc_raw.extend_from_slice(&bytes[..run]);
+        }
+        if run == bytes.len() {
+            return run;
+        }
+        self.advance_osc_string(performer, bytes[run]);
+        run + 1
     }
 
     #[inline(always)]
