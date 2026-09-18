@@ -29,6 +29,15 @@ const SYNC_UPDATE_TIMEOUT: Duration = Duration::from_millis(150);
 /// Maximum number of bytes read in one synchronized update (2MiB).
 const SYNC_BUFFER_SIZE: usize = 0x20_0000;
 
+/// Buffer capacity kept between synchronized updates (64KiB).
+///
+/// The buffer used to be reserved at `SYNC_BUFFER_SIZE` when a `Processor` was constructed, so
+/// every pane paid 2MiB whether or not it ever saw a synchronized update. It now grows on demand
+/// and keeps this much afterwards: a synchronized update is normally a screen repaint, comfortably
+/// under this, so the usual case still never reallocates. Anything larger is a one-off and is
+/// handed back rather than held for the life of the pane.
+const SYNC_RETAINED_CAPACITY: usize = 64 * 1024;
+
 /// Number of bytes in the BSU/ESU CSI sequences.
 const SYNC_ESCAPE_LEN: usize = 8;
 
@@ -206,7 +215,10 @@ struct SyncState<T: Timeout> {
 
 impl<T: Timeout> Default for SyncState<T> {
     fn default() -> Self {
-        Self { buffer: Vec::with_capacity(SYNC_BUFFER_SIZE), timeout: Default::default() }
+        // Grown on the first synchronized update rather than reserved up front; `advance_sync`
+        // bounds it against `SYNC_BUFFER_SIZE` explicitly, so the reservation bought nothing but
+        // 2MiB per pane.
+        Self { buffer: Vec::new(), timeout: Default::default() }
     }
 }
 
@@ -289,6 +301,9 @@ impl<T: Timeout> Processor<T> {
                 handler.unset_private_mode(NamedPrivateMode::SyncUpdate.into());
                 self.state.sync_state.timeout.clear_timeout();
                 self.state.sync_state.buffer.clear();
+                if self.state.sync_state.buffer.capacity() > SYNC_RETAINED_CAPACITY {
+                    self.state.sync_state.buffer.shrink_to(SYNC_RETAINED_CAPACITY);
+                }
             },
         }
     }
@@ -2222,6 +2237,41 @@ mod tests {
             assert_eq!(parser.state.sync_state.timeout.is_sync, 0);
             assert!(handler.attr.take().is_some());
         }
+    }
+
+    #[test]
+    fn the_sync_buffer_is_grown_on_demand_and_handed_back() {
+        // Every `Processor` used to reserve SYNC_BUFFER_SIZE at construction, so a pane that never
+        // saw a synchronized update still paid 2MiB for one.
+        let mut parser = Processor::<TestSyncHandler>::new();
+        let mut handler = MockHandler::default();
+
+        assert_eq!(
+            parser.state.sync_state.buffer.capacity(),
+            0,
+            "a fresh processor reserves nothing",
+        );
+
+        // An ordinary synchronized update still buffers and replays correctly.
+        parser.advance(&mut handler, b"\x1b[?2026h");
+        parser.advance(&mut handler, b"\x1b[31m");
+        assert!(handler.attr.is_none(), "the update is held while synchronized");
+        parser.advance(&mut handler, b"\x1b[?2026l");
+        assert!(handler.attr.take().is_some(), "the held bytes are replayed on ESU");
+        assert!(parser.state.sync_state.buffer.capacity() <= SYNC_RETAINED_CAPACITY);
+
+        // A large update grows the buffer, and ending it hands the excess back.
+        parser.advance(&mut handler, b"\x1b[?2026h");
+        parser.advance(&mut handler, "a".repeat(SYNC_RETAINED_CAPACITY * 4).as_bytes());
+        assert!(
+            parser.state.sync_state.buffer.capacity() > SYNC_RETAINED_CAPACITY,
+            "the buffer grows to hold a large update",
+        );
+        parser.advance(&mut handler, b"\x1b[?2026l");
+        assert!(
+            parser.state.sync_state.buffer.capacity() <= SYNC_RETAINED_CAPACITY,
+            "capacity past the retained floor is released rather than held for the pane's life",
+        );
     }
 
     #[test]
