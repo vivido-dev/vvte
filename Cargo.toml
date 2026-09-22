@@ -1,6 +1,6 @@
 [package]
 name = "vvte"
-version = "0.15.0"
+version = "0.15.1"
 edition = "2024"
 rust-version = "1.88"
 description = "Terminal stream parser for Vivido and related projects"
