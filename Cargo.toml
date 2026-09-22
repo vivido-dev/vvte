@@ -4,6 +4,7 @@ version = "0.15.1"
 edition = "2024"
 rust-version = "1.88"
 description = "Terminal stream parser for Vivido and related projects"
+readme = "README.md"
 repository = "https://github.com/vivido-dev/vvte"
 license = "Apache-2.0 OR MIT"
 # Derived from vte 0.15.0, upstream revision 3b3da71c34cc1256c7e20981cf03f8eb95e08ffc.
