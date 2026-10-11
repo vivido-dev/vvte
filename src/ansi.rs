@@ -655,6 +655,23 @@ pub trait Handler {
     /// Report text area size in characters.
     fn text_area_size_chars(&mut self) {}
 
+    /// Report the size of one character cell in pixels.
+    fn text_area_cell_size_pixels(&mut self) {}
+
+    /// An application program command (`ESC _`) has started.
+    fn apc_start(&mut self) {}
+
+    /// Deliver the next run of bytes of the current application program command.
+    ///
+    /// Runs are split wherever the input was split and carry no framing of their own.
+    fn apc_put(&mut self, _bytes: &[u8]) {}
+
+    /// The current application program command has ended.
+    ///
+    /// `cancelled` is `true` unless the `ESC \` string terminator closed it; what was delivered
+    /// of a cancelled command is incomplete.
+    fn apc_end(&mut self, _cancelled: bool) {}
+
     /// Set hyperlink.
     fn set_hyperlink(&mut self, _: Option<Hyperlink>) {}
 
@@ -1195,6 +1212,21 @@ where
     }
 
     #[inline]
+    fn apc_start(&mut self) {
+        self.handler.apc_start();
+    }
+
+    #[inline]
+    fn apc_put(&mut self, bytes: &[u8]) {
+        self.handler.apc_put(bytes);
+    }
+
+    #[inline]
+    fn apc_end(&mut self, cancelled: bool) {
+        self.handler.apc_end(cancelled);
+    }
+
+    #[inline]
     fn osc_dispatch(&mut self, params: &[&[u8]], bell_terminated: bool) {
         let terminator = if bell_terminated { "\x07" } else { "\x1b\\" };
 
@@ -1586,6 +1618,7 @@ where
             ('T', []) => handler.scroll_down(next_param_or(1) as usize),
             ('t', []) => match next_param_or(1) as usize {
                 14 => handler.text_area_size_pixels(),
+                16 => handler.text_area_cell_size_pixels(),
                 18 => handler.text_area_size_chars(),
                 22 => handler.push_title(),
                 23 => handler.pop_title(),
@@ -1891,6 +1924,8 @@ mod tests {
         identity_reported: bool,
         color: Option<Rgb>,
         reset_colors: Vec<usize>,
+        /// Order-sensitive record of the events the APC tests care about.
+        events: Vec<String>,
     }
 
     impl Handler for MockHandler {
@@ -1922,6 +1957,26 @@ mod tests {
         fn reset_color(&mut self, index: usize) {
             self.reset_colors.push(index)
         }
+
+        fn goto(&mut self, line: i32, col: usize) {
+            self.events.push(format!("goto {line} {col}"));
+        }
+
+        fn text_area_cell_size_pixels(&mut self) {
+            self.events.push("cell size".into());
+        }
+
+        fn apc_start(&mut self) {
+            self.events.push("apc:".into());
+        }
+
+        fn apc_put(&mut self, bytes: &[u8]) {
+            self.events.last_mut().unwrap().push_str(str::from_utf8(bytes).unwrap());
+        }
+
+        fn apc_end(&mut self, cancelled: bool) {
+            self.events.last_mut().unwrap().push_str(if cancelled { " cancelled" } else { " end" });
+        }
     }
 
     impl Default for MockHandler {
@@ -1933,6 +1988,7 @@ mod tests {
                 identity_reported: false,
                 color: None,
                 reset_colors: Vec::new(),
+                events: Vec::new(),
             }
         }
     }
@@ -2160,6 +2216,31 @@ mod tests {
 
         let expected: Vec<usize> = (0..256).collect();
         assert_eq!(handler.reset_colors, expected);
+    }
+
+    #[test]
+    fn apc_reaches_the_handler_in_order_with_surrounding_sequences() {
+        let mut parser = Processor::<TestSyncHandler>::new();
+        let mut handler = MockHandler::default();
+
+        parser.advance(&mut handler, b"\x1b[3;4H\x1b_Gi=1;QUJD\x1b\\\x1b[5;6H\x1b[16t");
+
+        assert_eq!(handler.events, ["goto 2 3", "apc:Gi=1;QUJD end", "goto 4 5", "cell size"]);
+    }
+
+    /// A graphics command placed with the cursor must not run before a cursor move that is still
+    /// held in the synchronized-update buffer.
+    #[test]
+    fn apc_inside_a_synchronized_update_is_replayed_in_order() {
+        let mut parser = Processor::<TestSyncHandler>::new();
+        let mut handler = MockHandler::default();
+
+        parser.advance(&mut handler, b"\x1b[?2026h\x1b[3;4H\x1b_Gi=1;QU");
+        parser.advance(&mut handler, b"JD\x1b\\\x1b[5;6H");
+        assert!(handler.events.is_empty(), "nothing runs while the update is held");
+
+        parser.advance(&mut handler, b"\x1b[?2026l");
+        assert_eq!(handler.events, ["goto 2 3", "apc:Gi=1;QUJD end", "goto 4 5"]);
     }
 
     #[test]

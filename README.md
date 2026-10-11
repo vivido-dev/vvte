@@ -14,7 +14,7 @@ the canonical terminator, and only supports 7-bit codes.
 
 ## Why the fork
 
-`vvte` keeps the upstream parser and API, with three changes that matter for Vivido's use as a
+`vvte` keeps the upstream parser and API, with four changes that matter for Vivido's use as a
 long-lived GPU terminal:
 
 - **Growable OSC buffer.** Upstream reserves a fixed 2 MiB inline array for OSC/DCS payloads in
@@ -24,6 +24,11 @@ long-lived GPU terminal:
 - **Bulk OSC handling.** The advance loop leaves the per-byte dispatch for OSC runs and appends
   payloads in bulk, which shortens the hot path for the large in-band sequences Vivido terminals
   process.
+- **APC dispatch.** Upstream discards application program commands (`ESC _ … ESC \`). Here
+  `Perform::apc_start`, `apc_put` and `apc_end` deliver them, with the data handed over in whole
+  runs rather than a byte at a time, since an APC is how the Kitty graphics protocol carries
+  megabytes of image data. A command counts as complete only when `ESC \` closes it; CAN, SUB or
+  the start of another escape sequence cancel it. SOS and PM strings are still ignored.
 - **Debug-gated diagnostics.** Formatting of unsupported OSC sequence diagnostics happens only
   when debug logging is enabled, so release builds never pay for it.
 

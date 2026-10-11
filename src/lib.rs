@@ -134,8 +134,8 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
 
     /// Advance a non-ground state, returning the number of bytes consumed.
     ///
-    /// Every state but `OscString` consumes exactly the one byte it is given; OSC payloads are
-    /// appended in bulk, so that arm reports its own run length.
+    /// Every state but `OscString` and `ApcString` consumes exactly the one byte it is given; OSC
+    /// and APC payloads are handled in bulk, so those arms report their own run length.
     #[inline(always)]
     fn change_state<P: Perform>(&mut self, performer: &mut P, bytes: &[u8]) -> usize {
         let byte = bytes[0];
@@ -153,6 +153,8 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
             State::EscapeIntermediate => self.advance_esc_intermediate(performer, byte),
             State::OscString => return self.advance_osc_string_bulk(performer, bytes),
             State::SosPmApcString => self.anywhere(performer, byte),
+            State::ApcString => return self.advance_apc_string_bulk(performer, bytes),
+            State::ApcEscape => self.advance_apc_escape(performer, byte),
             State::Ground => unreachable!(),
         }
         1
@@ -348,7 +350,11 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
                 self.osc_num_params = 0;
                 self.state = State::OscString
             },
-            0x5E..=0x5F => self.state = State::SosPmApcString,
+            0x5E => self.state = State::SosPmApcString,
+            0x5F => {
+                performer.apc_start();
+                self.state = State::ApcString
+            },
             0x60..=0x7E => {
                 performer.esc_dispatch(self.intermediates(), self.ignoring, byte);
                 self.state = State::Ground
@@ -423,6 +429,61 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
         }
         self.advance_osc_string(performer, bytes[run]);
         run + 1
+    }
+
+    /// Advance an APC string payload in bulk.
+    ///
+    /// An application program command carries opaque data up to its terminator, and that data can
+    /// be megabytes of image payload. Everything before the next ESC, CAN or SUB is handed to
+    /// [`Perform::apc_put`] as one slice, so the payload is searched with SIMD instead of being
+    /// stepped through the state machine a byte at a time.
+    ///
+    /// CAN and SUB cancel the string. ESC only might end it: whether it does is decided by the
+    /// byte after it, in [`Self::advance_apc_escape`].
+    ///
+    /// Skipping [`Perform::terminated`] for the bulk run is sound for the reason given on
+    /// [`Self::advance_osc_string_bulk`]: only a CSI dispatch sets it.
+    ///
+    /// Kept out of line so the bulk scan does not enlarge the hot per-byte dispatch.
+    #[inline(never)]
+    fn advance_apc_string_bulk<P: Perform>(&mut self, performer: &mut P, bytes: &[u8]) -> usize {
+        let run = memchr::memchr3(0x1B, 0x18, 0x1A, bytes).unwrap_or(bytes.len());
+        if run > 0 {
+            performer.apc_put(&bytes[..run]);
+        }
+        if run == bytes.len() {
+            return run;
+        }
+        match bytes[run] {
+            0x1B => self.state = State::ApcEscape,
+            byte => {
+                performer.apc_end(true);
+                performer.execute(byte);
+                self.state = State::Ground
+            },
+        }
+        run + 1
+    }
+
+    /// Decide what the ESC that interrupted an APC string meant.
+    ///
+    /// Followed by `\` it was the string terminator, and the command is complete. Followed by
+    /// anything else it began an unrelated escape sequence: the command is cancelled, and the
+    /// byte is interpreted as that sequence's second byte.
+    ///
+    /// Kept out of line: it runs once per command, and inlining it would put a second copy of
+    /// the escape dispatch into the hot per-byte path.
+    #[inline(never)]
+    fn advance_apc_escape<P: Perform>(&mut self, performer: &mut P, byte: u8) {
+        if byte == 0x5C {
+            performer.apc_end(false);
+            self.state = State::Ground;
+        } else {
+            performer.apc_end(true);
+            self.reset_params();
+            self.state = State::Escape;
+            self.advance_esc(performer, byte);
+        }
     }
 
     #[inline(always)]
@@ -722,7 +783,12 @@ enum State {
     Escape,
     EscapeIntermediate,
     OscString,
+    /// SOS and PM strings, which are consumed and ignored.
     SosPmApcString,
+    /// An APC string, whose payload is delivered through [`Perform::apc_put`].
+    ApcString,
+    /// An ESC inside an APC string, which is its terminator only if `\` follows.
+    ApcEscape,
     #[default]
     Ground,
 }
@@ -769,6 +835,25 @@ pub trait Perform {
 
     /// Dispatch an operating system command.
     fn osc_dispatch(&mut self, _params: &[&[u8]], _bell_terminated: bool) {}
+
+    /// An application program command (`ESC _`) has started.
+    ///
+    /// Every start is followed by zero or more [`Self::apc_put`] calls and exactly one
+    /// [`Self::apc_end`], unless the parser itself is dropped or replaced mid-string.
+    fn apc_start(&mut self) {}
+
+    /// Deliver the next run of bytes of the current application program command.
+    ///
+    /// The command's data arrives split wherever the input was split, so a run carries no
+    /// framing of its own. Runs never contain ESC, CAN or SUB, and are never empty.
+    fn apc_put(&mut self, _bytes: &[u8]) {}
+
+    /// The current application program command has ended.
+    ///
+    /// `cancelled` is `false` when the `ESC \` string terminator closed it. It is `true` when
+    /// CAN, SUB, or the start of another escape sequence cut it short, in which case whatever
+    /// had been delivered is incomplete.
+    fn apc_end(&mut self, _cancelled: bool) {}
 
     /// A final character has arrived for a CSI sequence
     ///
@@ -820,6 +905,8 @@ mod tests {
     #[derive(Default)]
     struct Dispatcher {
         dispatched: Vec<Sequence>,
+        /// Data of the application program command currently being received.
+        apc: Option<Vec<u8>>,
     }
 
     #[derive(Debug, PartialEq, Eq)]
@@ -832,6 +919,7 @@ mod tests {
         Print(char),
         Execute(u8),
         DcsUnhook,
+        Apc(Vec<u8>, bool),
     }
 
     impl Perform for Dispatcher {
@@ -871,6 +959,21 @@ mod tests {
 
         fn execute(&mut self, byte: u8) {
             self.dispatched.push(Sequence::Execute(byte));
+        }
+
+        fn apc_start(&mut self) {
+            assert!(self.apc.is_none(), "an APC started inside another");
+            self.apc = Some(Vec::new());
+        }
+
+        fn apc_put(&mut self, bytes: &[u8]) {
+            assert!(!bytes.is_empty(), "an APC run must carry data");
+            self.apc.as_mut().expect("APC data outside a command").extend_from_slice(bytes);
+        }
+
+        fn apc_end(&mut self, cancelled: bool) {
+            let data = self.apc.take().expect("APC end outside a command");
+            self.dispatched.push(Sequence::Apc(data, cancelled));
         }
     }
 
@@ -1431,5 +1534,102 @@ mod tests {
         assert_eq!(dispatcher.dispatched.len(), 2);
         assert_eq!(dispatcher.dispatched[0], Sequence::Execute(0x18));
         assert_eq!(dispatcher.dispatched[1], Sequence::Execute(0x1A));
+    }
+    /// Feed `input` split at `split` and return what the parser dispatched.
+    fn dispatch_split(input: &[u8], split: usize) -> Vec<Sequence> {
+        let mut dispatcher = Dispatcher::default();
+        let mut parser: Parser = Parser::default();
+        parser.advance(&mut dispatcher, &input[..split]);
+        parser.advance(&mut dispatcher, &input[split..]);
+        assert!(dispatcher.apc.is_none(), "an APC was left open");
+        dispatcher.dispatched
+    }
+
+    #[test]
+    fn apc_data_is_delivered_whole_across_every_split() {
+        const INPUT: &[u8] = b"a\x1b_Gf=32,m=1;QUJDRA==\x1b\\b";
+        let expected = vec![
+            Sequence::Print('a'),
+            Sequence::Apc(b"Gf=32,m=1;QUJDRA==".to_vec(), false),
+            Sequence::Print('b'),
+        ];
+
+        for split in 0..=INPUT.len() {
+            assert_eq!(dispatch_split(INPUT, split), expected, "split at {split}");
+        }
+    }
+
+    #[test]
+    fn an_empty_apc_still_starts_and_ends() {
+        for split in 0..=4 {
+            assert_eq!(dispatch_split(b"\x1b_\x1b\\", split), vec![Sequence::Apc(vec![], false)]);
+        }
+    }
+
+    #[test]
+    fn can_and_sub_cancel_an_apc() {
+        for cancel in [0x18, 0x1A] {
+            let input = [b"\x1b_Gabc".as_slice(), &[cancel], b"d"].concat();
+            for split in 0..=input.len() {
+                assert_eq!(
+                    dispatch_split(&input, split),
+                    vec![
+                        Sequence::Apc(b"Gabc".to_vec(), true),
+                        Sequence::Execute(cancel),
+                        Sequence::Print('d'),
+                    ],
+                    "cancel {cancel:#x} split at {split}"
+                );
+            }
+        }
+    }
+
+    /// Only `ESC \` completes a command. Any other escape cancels it and is then interpreted
+    /// normally, so a command cut off by other output never runs half-received.
+    #[test]
+    fn another_escape_sequence_cancels_an_apc_and_is_still_dispatched() {
+        const INPUT: &[u8] = b"\x1b_Gabc\x1b[31mz";
+        for split in 0..=INPUT.len() {
+            assert_eq!(
+                dispatch_split(INPUT, split),
+                vec![
+                    Sequence::Apc(b"Gabc".to_vec(), true),
+                    Sequence::Csi(vec![vec![31]], vec![], false, 'm'),
+                    Sequence::Print('z'),
+                ],
+                "split at {split}"
+            );
+        }
+        assert_eq!(
+            dispatch_split(b"\x1b_Gabc\x1bM", 3),
+            vec![Sequence::Apc(b"Gabc".to_vec(), true), Sequence::Esc(vec![], false, b'M')]
+        );
+    }
+
+    #[test]
+    fn an_apc_can_follow_one_that_its_introducer_cancelled() {
+        assert_eq!(
+            dispatch_split(b"\x1b_one\x1b_two\x1b\\", 5),
+            vec![Sequence::Apc(b"one".to_vec(), true), Sequence::Apc(b"two".to_vec(), false)]
+        );
+    }
+
+    #[test]
+    fn apc_data_passes_control_bytes_through_untouched() {
+        assert_eq!(
+            dispatch_split(b"\x1b_a\nb\x07c\x7f\x1b\\", 3),
+            vec![Sequence::Apc(b"a\nb\x07c\x7f".to_vec(), false)]
+        );
+    }
+
+    #[test]
+    fn sos_and_pm_strings_stay_ignored() {
+        for introducer in *b"X^" {
+            let input = [b"\x1b".as_slice(), &[introducer], b"ignored\x1b\\z"].concat();
+            assert_eq!(
+                dispatch_split(&input, 5),
+                vec![Sequence::Esc(vec![], false, b'\\'), Sequence::Print('z'),]
+            );
+        }
     }
 }
