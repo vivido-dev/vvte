@@ -47,6 +47,7 @@ pub struct Parser<const OSC_RAW_BUF_SIZE: usize = 1024> {
     params: Params,
     param: u16,
     osc_raw: Vec<u8>,
+    osc_discard: bool,
     /// End offset of each OSC parameter inside `osc_raw`.
     ///
     /// Parameters are stored back to back without their `;` separators, so the
@@ -143,7 +144,7 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
             State::CsiEntry => self.advance_csi_entry(performer, byte),
             State::CsiIgnore => self.advance_csi_ignore(performer, byte),
             State::CsiIntermediate => self.advance_csi_intermediate(performer, byte),
-            State::CsiParam => self.advance_csi_param(performer, byte),
+            State::CsiParam => return self.advance_csi_params(performer, bytes),
             State::DcsEntry => self.advance_dcs_entry(performer, byte),
             State::DcsIgnore => self.anywhere(performer, byte),
             State::DcsIntermediate => self.advance_dcs_intermediate(performer, byte),
@@ -209,6 +210,33 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
             0x40..=0x7E => self.action_csi_dispatch(performer, byte),
             _ => self.anywhere(performer, byte),
         }
+    }
+
+    /// Consume common parameter spans without re-entering the state dispatcher.
+    fn advance_csi_params<P: Perform>(&mut self, performer: &mut P, bytes: &[u8]) -> usize {
+        let mut param = self.param;
+        for (index, &byte) in bytes.iter().enumerate() {
+            match byte {
+                b'0'..=b'9' if !self.params.is_full() => {
+                    param = param.saturating_mul(10).saturating_add(u16::from(byte - b'0'));
+                },
+                b';' | b':' if !self.params.is_full() => {
+                    if byte == b';' {
+                        self.params.push(param);
+                    } else {
+                        self.params.extend(param);
+                    }
+                    param = 0;
+                },
+                _ => {
+                    self.param = param;
+                    self.advance_csi_param(performer, byte);
+                    return index + 1;
+                },
+            }
+        }
+        self.param = param;
+        bytes.len()
     }
 
     #[inline(always)]
@@ -346,6 +374,7 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
                 self.state = State::Ground
             },
             0x5D => {
+                self.osc_discard = false;
                 self.osc_raw.clear();
                 self.osc_num_params = 0;
                 self.state = State::OscString
@@ -401,8 +430,16 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
                 self.reset_params();
                 self.state = State::Escape
             },
-            0x3B => self.action_osc_put_param(),
-            _ => self.action_osc_put(byte),
+            0x3B => {
+                if self.osc_num_params == 0 && !self.osc_discard {
+                    self.osc_discard = !performer.osc_capture(&self.osc_raw);
+                }
+                if !self.osc_discard {
+                    self.action_osc_put_param();
+                }
+            },
+            _ if !self.osc_discard => self.action_osc_put(byte),
+            _ => (),
         }
     }
 
@@ -420,8 +457,11 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
     /// Kept out of line so the bulk scan does not enlarge the hot per-byte dispatch.
     #[inline(never)]
     fn advance_osc_string_bulk<P: Perform>(&mut self, performer: &mut P, bytes: &[u8]) -> usize {
-        let run = bytes.iter().position(|&b| b < 0x20 || b == b';').unwrap_or(bytes.len());
-        if run > 0 {
+        let run = bytes
+            .iter()
+            .position(|&b| b < 0x20 || (!self.osc_discard && b == b';'))
+            .unwrap_or(bytes.len());
+        if run > 0 && !self.osc_discard {
             self.osc_raw.extend_from_slice(&bytes[..run]);
         }
         if run == bytes.len() {
@@ -588,8 +628,10 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
     }
 
     fn osc_end<P: Perform>(&mut self, performer: &mut P, byte: u8) {
-        self.action_osc_put_param();
-        self.osc_dispatch(performer, byte);
+        if !self.osc_discard {
+            self.action_osc_put_param();
+            self.osc_dispatch(performer, byte);
+        }
         self.osc_raw.clear();
         self.osc_num_params = 0;
     }
@@ -716,7 +758,11 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
                 // SAFETY: This is only reached with `partial_utf8_len >= 1`, so `parsed`
                 // is a non-empty `str` and always yields at least one character.
                 let c = unsafe { parsed.chars().next().unwrap_unchecked() };
-                performer.print(c);
+                if matches!(c, '\u{80}'..='\u{9f}') {
+                    performer.execute(c as u8);
+                } else {
+                    performer.print(c);
+                }
 
                 self.partial_utf8_len = 0;
                 c.len_utf8() - old_bytes
@@ -735,7 +781,11 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
                         parsed.chars().next().unwrap_unchecked()
                     };
 
-                    performer.print(c);
+                    if matches!(c, '\u{80}'..='\u{9f}') {
+                        performer.execute(c as u8);
+                    } else {
+                        performer.print(c);
+                    }
 
                     self.partial_utf8_len = 0;
                     return valid_bytes - old_bytes;
@@ -760,11 +810,18 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
     /// Handle ground dispatch of print/execute for all characters in a string.
     #[inline]
     fn ground_dispatch<P: Perform>(performer: &mut P, text: &str) {
-        for c in text.chars() {
-            match c {
-                '\x00'..='\x1f' | '\u{80}'..='\u{9f}' => performer.execute(c as u8),
-                _ => performer.print(c),
+        let mut start = 0;
+        for (offset, c) in text.char_indices() {
+            if matches!(c, '\x00'..='\x1f' | '\u{80}'..='\u{9f}') {
+                if start < offset {
+                    performer.print_str(&text[start..offset]);
+                }
+                performer.execute(c as u8);
+                start = offset + c.len_utf8();
             }
+        }
+        if start < text.len() {
+            performer.print_str(&text[start..]);
         }
     }
 }
@@ -806,6 +863,21 @@ enum State {
 pub trait Perform {
     /// Draw a character to the screen and update states.
     fn print(&mut self, _c: char) {}
+
+    /// Print a borrowed run with the same semantics as individual characters.
+    fn print_str(&mut self, text: &str) {
+        for c in text.chars() {
+            self.print(c);
+        }
+    }
+
+    /// Decide whether to capture an OSC body after its command separator.
+    ///
+    /// Returning false discards its body and suppresses `osc_dispatch`, while
+    /// preserving framing and control handling. The default captures every command.
+    fn osc_capture(&mut self, _command: &[u8]) -> bool {
+        true
+    }
 
     /// Execute a C0 or C1 control function.
     fn execute(&mut self, _byte: u8) {}
@@ -974,6 +1046,82 @@ mod tests {
         fn apc_end(&mut self, cancelled: bool) {
             let data = self.apc.take().expect("APC end outside a command");
             self.dispatched.push(Sequence::Apc(data, cancelled));
+        }
+    }
+
+    #[test]
+    fn rejected_osc_body_is_not_buffered_and_next_command_survives() {
+        #[derive(Default)]
+        struct Sink {
+            text: String,
+            commands: usize,
+        }
+        impl Perform for Sink {
+            fn print(&mut self, c: char) {
+                self.text.push(c);
+            }
+            fn osc_capture(&mut self, command: &[u8]) -> bool {
+                command == b"2"
+            }
+            fn osc_dispatch(&mut self, _: &[&[u8]], _: bool) {
+                self.commands += 1;
+            }
+        }
+        let mut parser = Parser::<1024>::default();
+        let mut sink = Sink::default();
+        parser.advance(&mut sink, b"\x1b]6;");
+        let capacity = parser.osc_raw.capacity();
+        for _ in 0..16 {
+            parser.advance(&mut sink, &[b'x'; 65536]);
+        }
+        assert_eq!(parser.osc_raw.capacity(), capacity);
+        parser.advance(&mut sink, b";tail\x07ok\x1b]2;title\x1b\\end");
+        assert_eq!(sink.commands, 1);
+        assert_eq!(sink.text, "okend");
+    }
+
+    #[test]
+    fn printable_runs_reach_the_batch_callback() {
+        #[derive(Default)]
+        struct Sink {
+            runs: Vec<String>,
+        }
+        impl Perform for Sink {
+            fn print(&mut self, _: char) {
+                panic!("complete runs must stay batched");
+            }
+            fn print_str(&mut self, text: &str) {
+                self.runs.push(text.into());
+            }
+        }
+        let mut parser = Parser::<1024>::default();
+        let mut sink = Sink::default();
+        parser.advance(&mut sink, "hello界\nworld\u{80}after".as_bytes());
+        assert_eq!(sink.runs, ["hello界", "world", "after"]);
+    }
+
+    #[test]
+    fn bulk_and_byte_feeds_have_identical_actions() {
+        let inputs: &[&[u8]] = &[
+            b"abc\tdef\r\n\x1b[1;2:3;999999999999999999mtext\x1b[0m",
+            "a界\u{301}😀\u{80}z".as_bytes(),
+            b"a\xf0\x9f\x1b[31mx\xff\x80",
+            b"\x1b[1;2\x18abc\x1b[?2026habc\x1b[?2026l",
+            b"\x1b]6;ignored;body\x07ok\x1b_Ga=t;AAAA\x1b\\end",
+        ];
+        for input in inputs {
+            let mut expected = Dispatcher::default();
+            let mut parser = Parser::<1024>::default();
+            for byte in *input {
+                parser.advance(&mut expected, std::slice::from_ref(byte));
+            }
+            for split in 0..=input.len() {
+                let mut actual = Dispatcher::default();
+                let mut parser = Parser::<1024>::default();
+                parser.advance(&mut actual, &input[..split]);
+                parser.advance(&mut actual, &input[split..]);
+                assert_eq!(actual.dispatched, expected.dispatched, "split {split}");
+            }
         }
     }
 

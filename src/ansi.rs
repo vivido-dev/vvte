@@ -453,6 +453,13 @@ pub trait Handler {
     /// A character to be displayed.
     fn input(&mut self, _c: char) {}
 
+    /// Display a borrowed printable run, preserving scalar input semantics.
+    fn input_str(&mut self, text: &str) {
+        for c in text.chars() {
+            self.input(c);
+        }
+    }
+
     /// Display `c` exactly `count` times, using the current attributes and character set.
     ///
     /// The processor normalizes REP's omitted or zero parameter to one. This method must have
@@ -1176,6 +1183,33 @@ where
     fn print(&mut self, c: char) {
         self.handler.input(c);
         self.state.preceding_char = Some(c);
+    }
+
+    fn print_str(&mut self, text: &str) {
+        self.handler.input_str(text);
+        if let Some(c) = text.chars().next_back() {
+            self.state.preceding_char = Some(c);
+        }
+    }
+
+    fn osc_capture(&mut self, command: &[u8]) -> bool {
+        log::log_enabled!(log::Level::Debug)
+            || matches!(
+                command,
+                b"0" | b"2"
+                    | b"4"
+                    | b"8"
+                    | b"10"
+                    | b"11"
+                    | b"12"
+                    | b"22"
+                    | b"50"
+                    | b"52"
+                    | b"104"
+                    | b"110"
+                    | b"111"
+                    | b"112"
+            )
     }
 
     #[inline]

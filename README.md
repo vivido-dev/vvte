@@ -78,3 +78,13 @@ a no-op default.
 Licensed under either of [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT) at your option.
 
 Derived from `vte` 0.15.0; `src/ansi.rs` retains its upstream Apache-2.0 license notice.
+
+## Batched text and selective OSC capture
+
+Version 0.15.3 adds `Perform::print_str` and `ansi::Handler::input_str` with
+scalar defaults. Optimized handlers can consume borrowed printable runs without
+changing existing consumers. CSI parameters are consumed in spans. The opt-in
+`Perform::osc_capture` hook can reject an OSC body after its command separator;
+framing still runs, but rejected bodies are neither retained nor dispatched.
+The ANSI adapter uses this for unsupported commands when debug logging is off.
+Split UTF-8 C1 controls now dispatch identically to complete input chunks.
