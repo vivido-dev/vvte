@@ -18,9 +18,10 @@ the canonical terminator, and only supports 7-bit codes.
 long-lived GPU terminal:
 
 - **Growable OSC buffer.** Upstream reserves a fixed 2 MiB inline array for OSC/DCS payloads in
-  every parser. Here the payload lives in a heap `Vec` that grows on demand — the
-  `Parser::<OSC_RAW_BUF_SIZE>` const parameter remains for API compatibility, but it no longer
-  caps payload size.
+  every parser. Here the payload lives in a heap `Vec` that grows on demand up to 8 MiB, enough
+  for large OSC 52 clipboard writes; a longer body is discarded as it arrives and never
+  dispatched, so output that never terminates an OSC cannot exhaust memory. The
+  `Parser::<OSC_RAW_BUF_SIZE>` const parameter remains for API compatibility but has no effect.
 - **Bulk OSC handling.** The advance loop leaves the per-byte dispatch for OSC runs and appends
   payloads in bulk, which shortens the hot path for the large in-band sequences Vivido terminals
   process.
@@ -29,8 +30,10 @@ long-lived GPU terminal:
   runs rather than a byte at a time, since an APC is how the Kitty graphics protocol carries
   megabytes of image data. A command counts as complete only when `ESC \` closes it; CAN, SUB or
   the start of another escape sequence cancel it. SOS and PM strings are still ignored.
-- **Debug-gated diagnostics.** Formatting of unsupported OSC sequence diagnostics happens only
-  when debug logging is enabled, so release builds never pay for it.
+- **Debug-gated diagnostics.** Unhandled sequences are logged at debug level as named events
+  (`event = "vvte.<kind>.<state>"`) with their payload in key-value fields, never in the message.
+  Nothing is formatted unless debug logging is enabled, and nothing is logged per DCS byte or
+  per color operation.
 
 Upstream's `no_std` support is dropped; the parser requires `std`.
 
@@ -62,7 +65,7 @@ impl Perform for Printer {
     }
 }
 
-let mut parser = Parser::default();
+let mut parser: Parser = Parser::default();
 parser.advance(&mut Printer, b"hello \x1b[1mworld\x1b[0m\r\n");
 ```
 

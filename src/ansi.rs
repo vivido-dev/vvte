@@ -4,9 +4,56 @@
 // licensed under the Apache License, Version 2.0 and is part of the Alacritty
 // project (https://github.com/alacritty/alacritty).
 
-//! ANSI Terminal Stream Parsing.
+//! Terminal semantics on top of the raw parser: cursor, colors, modes, and synchronized updates.
+//!
+//! [`Processor`] wraps a [`Parser`](crate::Parser) and translates the actions it reports into
+//! calls on a [`Handler`], the interface a terminal emulator implements. Every [`Handler`]
+//! method has a no-op default, so an implementation overrides only what it supports. The other
+//! types in this module are the values those calls carry.
+//!
+//! # Synchronized updates
+//!
+//! `CSI ? 2026 h` (BSU) begins a synchronized update and `CSI ? 2026 l` (ESU) ends it, so that a
+//! program can redraw the screen without the terminal showing it half-drawn. While an update is
+//! pending, [`Processor::advance`] holds the incoming bytes instead of dispatching them, and
+//! replays them in order when the update ends: at ESU, when the held bytes would reach 2 MiB, or
+//! when the caller calls [`Processor::stop_sync`].
+//!
+//! The processor never ends an update because time has passed. At each BSU it calls
+//! [`Timeout::set_timeout`] with a 150 ms deadline, and **the caller must check that deadline and
+//! call [`Processor::stop_sync`] once it has passed** — with the default [`StdSyncHandler`],
+//! through [`Processor::sync_timeout`]. A caller that never checks leaves a program's output held
+//! until it sends ESU, which a crashed or misbehaving program never does.
+//!
+//! # Examples
+//!
+//! ```
+//! use vvte::ansi::{Handler, Processor};
+//!
+//! #[derive(Default)]
+//! struct Screen {
+//!     text: String,
+//!     title: Option<String>,
+//! }
+//!
+//! impl Handler for Screen {
+//!     fn input(&mut self, c: char) {
+//!         self.text.push(c);
+//!     }
+//!
+//!     fn set_title(&mut self, title: Option<String>) {
+//!         self.title = title;
+//!     }
+//! }
+//!
+//! let mut processor: Processor = Processor::new();
+//! let mut screen = Screen::default();
+//! processor.advance(&mut screen, b"\x1b]2;build\x07ok");
+//! assert_eq!(screen.text, "ok");
+//! assert_eq!(screen.title.as_deref(), Some("build"));
+//! ```
 
-use core::fmt::Write;
+use core::fmt;
 use core::ops::{Add, Mul};
 use core::str::FromStr;
 use core::time::Duration;
@@ -47,6 +94,7 @@ const BSU_CSI: [u8; SYNC_ESCAPE_LEN] = *b"\x1b[?2026h";
 /// ESU CSI sequence for terminating synchronized updates.
 const ESU_CSI: [u8; SYNC_ESCAPE_LEN] = *b"\x1b[?2026l";
 
+/// A hyperlink set by OSC 8.
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct Hyperlink {
     /// Identifier for the given hyperlink.
@@ -55,11 +103,15 @@ pub struct Hyperlink {
     pub uri: String,
 }
 
+/// A 24-bit color.
 #[derive(Debug, Eq, PartialEq, Copy, Clone, Default)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Rgb {
+    /// Red channel.
     pub r: u8,
+    /// Green channel.
     pub g: u8,
+    /// Blue channel.
     pub b: u8,
 }
 
@@ -68,8 +120,8 @@ impl Rgb {
     ///
     /// [W3C's luminance algorithm]: https://www.w3.org/TR/WCAG20/#relativeluminancedef
     fn luminance(self) -> f64 {
-        let channel_luminance = |channel| {
-            let channel = channel as f64 / 255.;
+        let channel_luminance = |channel: u8| {
+            let channel = f64::from(channel) / 255.;
             if channel <= 0.03928 {
                 channel / 12.92
             } else {
@@ -87,6 +139,7 @@ impl Rgb {
     /// Implementation of [W3C's contrast algorithm].
     ///
     /// [W3C's contrast algorithm]: https://www.w3.org/TR/WCAG20/#contrast-ratiodef
+    #[must_use]
     pub fn contrast(self, other: Rgb) -> f64 {
         let self_luminance = self.luminance();
         let other_luminance = other.luminance();
@@ -102,18 +155,22 @@ impl Rgb {
 }
 
 // A multiply function for Rgb, as the default dim is just *2/3.
+//
+// Renderers call this per dimmed cell, so it must stay free of logging.
 impl Mul<f32> for Rgb {
     type Output = Rgb;
 
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "each channel is clamped to 0..=255 before the cast"
+    )]
     fn mul(self, rhs: f32) -> Rgb {
-        let result = Rgb {
+        Rgb {
             r: (f32::from(self.r) * rhs).clamp(0.0, 255.0) as u8,
             g: (f32::from(self.g) * rhs).clamp(0.0, 255.0) as u8,
             b: (f32::from(self.b) * rhs).clamp(0.0, 255.0) as u8,
-        };
-
-        log::trace!("Scaling RGB by {} from {:?} to {:?}", rhs, self, result);
-        result
+        }
     }
 }
 
@@ -129,7 +186,7 @@ impl Add<Rgb> for Rgb {
     }
 }
 
-/// Parse colors in XParseColor format.
+/// Parse colors in `XParseColor` format.
 fn xparse_color(color: &[u8]) -> Option<Rgb> {
     if let Some(color) = color.strip_prefix(b"#") {
         parse_legacy_color(color)
@@ -150,13 +207,16 @@ fn parse_rgb_color(color: &[u8]) -> Option<Rgb> {
 
     // Scale values instead of filling with `0`s.
     let scale = |input: &str| {
-        if input.len() > 4 {
-            None
-        } else {
-            let max = u32::pow(16, input.len() as u32) - 1;
-            let value = u32::from_str_radix(input, 16).ok()?;
-            Some((255 * value / max) as u8)
-        }
+        // The largest value that many digits can hold; it maps to 255.
+        let max: u32 = match input.len() {
+            1 => 0xF,
+            2 => 0xFF,
+            3 => 0xFFF,
+            4 => 0xFFFF,
+            _ => return None,
+        };
+        let value = u32::from_str_radix(input, 16).ok()?;
+        u8::try_from(255 * value / max).ok()
     };
 
     Some(Rgb { r: scale(r)?, g: scale(g)?, b: scale(b)? })
@@ -166,10 +226,16 @@ fn parse_rgb_color(color: &[u8]) -> Option<Rgb> {
 fn parse_legacy_color(color: &[u8]) -> Option<Rgb> {
     let item_len = color.len() / 3;
 
-    // Truncate/Fill to two byte precision.
+    // Truncate/Fill to two hex digits: keep the two most significant digits of the channel,
+    // and fill a single digit with a zero. Only those digits are converted, so a channel of any
+    // length, leading zeros included, cannot overflow.
     let color_from_slice = |slice: &[u8]| {
-        let col = usize::from_str_radix(str::from_utf8(slice).ok()?, 16).ok()? << 4;
-        Some((col >> (4 * slice.len().saturating_sub(1))) as u8)
+        if slice.is_empty() || !slice.iter().all(u8::is_ascii_hexdigit) {
+            return None;
+        }
+        let top = str::from_utf8(&slice[..slice.len().min(2)]).ok()?;
+        let value = u8::from_str_radix(top, 16).ok()?;
+        Some(if slice.len() == 1 { value << 4 } else { value })
     };
 
     Some(Rgb {
@@ -222,26 +288,91 @@ impl<T: Timeout> Default for SyncState<T> {
     }
 }
 
-/// The processor wraps a `crate::Parser` to ultimately call methods on a
-/// Handler.
+/// Parses a terminal byte stream and dispatches it to a [`Handler`].
+///
+/// A processor owns a [`Parser`](crate::Parser) plus the state the ANSI layer keeps between
+/// calls: the last printed character, for REP, and any synchronized update in progress. Each
+/// terminal needs its own. `T` tracks the synchronized-update deadline; the default
+/// [`StdSyncHandler`] uses [`Instant`], and tests can supply their own [`Timeout`].
+///
+/// Callers must enforce the synchronized-update deadline themselves; the
+/// [module documentation](crate::ansi#synchronized-updates) describes the contract.
+///
+/// # Examples
+///
+/// Ending a synchronized update whose deadline has passed:
+///
+/// ```
+/// use std::time::Instant;
+///
+/// use vvte::ansi::{Handler, Processor};
+///
+/// #[derive(Default)]
+/// struct Screen(String);
+///
+/// impl Handler for Screen {
+///     fn input(&mut self, c: char) {
+///         self.0.push(c);
+///     }
+/// }
+///
+/// /// Runs whenever the event loop wakes up, for example after a read times out.
+/// fn on_wake(processor: &mut Processor, screen: &mut Screen) {
+///     let deadline = processor.sync_timeout().sync_timeout();
+///     if deadline.is_some_and(|deadline| deadline <= Instant::now()) {
+///         processor.stop_sync(screen);
+///     }
+/// }
+///
+/// let mut processor: Processor = Processor::new();
+/// let mut screen = Screen::default();
+/// processor.advance(&mut screen, b"\x1b[?2026hheld");
+/// assert_eq!(screen.0, "", "output is held while the update is pending");
+///
+/// on_wake(&mut processor, &mut screen);
+/// // Once 150 ms have passed, `on_wake` makes this call:
+/// processor.stop_sync(&mut screen);
+/// assert_eq!(screen.0, "held");
+/// ```
 #[derive(Default)]
 pub struct Processor<T: Timeout = StdSyncHandler> {
     state: ProcessorState<T>,
     parser: crate::Parser,
 }
 
+/// Shows the parser and synchronized-update state, not the held bytes.
+impl<T: Timeout + fmt::Debug> fmt::Debug for Processor<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Processor")
+            .field("parser", &self.parser)
+            .field("preceding_char", &self.state.preceding_char)
+            .field("sync_timeout", &self.state.sync_state.timeout)
+            .field("sync_bytes", &self.state.sync_state.buffer.len())
+            .finish()
+    }
+}
+
 impl<T: Timeout> Processor<T> {
+    /// Creates a processor with no synchronized update pending.
     #[inline]
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Synchronized update timeout.
+    /// Returns the synchronized-update deadline tracker.
+    ///
+    /// With [`StdSyncHandler`], `processor.sync_timeout().sync_timeout()` is the deadline after
+    /// which the caller must call [`Self::stop_sync`].
     pub fn sync_timeout(&self) -> &T {
         &self.state.sync_state.timeout
     }
 
-    /// Process a new byte from the PTY.
+    /// Parses `bytes` and dispatches the resulting operations to `handler`.
+    ///
+    /// Like [`Parser::advance`](crate::Parser::advance), `bytes` can end anywhere. While a
+    /// synchronized update is pending, bytes are held instead of dispatched; see the
+    /// [module documentation](crate::ansi#synchronized-updates).
     #[inline]
     pub fn advance<H>(&mut self, handler: &mut H, bytes: &[u8])
     where
@@ -259,7 +390,11 @@ impl<T: Timeout> Processor<T> {
         }
     }
 
-    /// End a synchronized update.
+    /// Ends the pending synchronized update and dispatches the bytes it held, in order.
+    ///
+    /// Call this once the update's deadline has passed (see [`Self::sync_timeout`]). It reports
+    /// the end of the update through [`Handler::unset_private_mode`]; with no update pending,
+    /// that report is all it does.
     pub fn stop_sync<H>(&mut self, handler: &mut H)
     where
         H: Handler,
@@ -286,29 +421,26 @@ impl<T: Timeout> Processor<T> {
         self.parser.advance(&mut performer, &buffer[..offset]);
         self.state.sync_state.buffer = buffer;
 
-        match bsu_offset {
+        if let Some(bsu_offset) = bsu_offset {
             // Just clear processed bytes if there is a new BSU.
             //
             // NOTE: We do not need to re-process for a new ESU since the `advance_sync`
             // function checks for BSUs in reverse.
-            Some(bsu_offset) => {
-                let new_len = self.state.sync_state.buffer.len() - bsu_offset;
-                self.state.sync_state.buffer.copy_within(bsu_offset.., 0);
-                self.state.sync_state.buffer.truncate(new_len);
-            },
+            let new_len = self.state.sync_state.buffer.len() - bsu_offset;
+            self.state.sync_state.buffer.copy_within(bsu_offset.., 0);
+            self.state.sync_state.buffer.truncate(new_len);
+        } else {
             // Report mode and clear state if no new BSU is present.
-            None => {
-                handler.unset_private_mode(NamedPrivateMode::SyncUpdate.into());
-                self.state.sync_state.timeout.clear_timeout();
-                self.state.sync_state.buffer.clear();
-                if self.state.sync_state.buffer.capacity() > SYNC_RETAINED_CAPACITY {
-                    self.state.sync_state.buffer.shrink_to(SYNC_RETAINED_CAPACITY);
-                }
-            },
+            handler.unset_private_mode(NamedPrivateMode::SyncUpdate.into());
+            self.state.sync_state.timeout.clear_timeout();
+            self.state.sync_state.buffer.clear();
+            if self.state.sync_state.buffer.capacity() > SYNC_RETAINED_CAPACITY {
+                self.state.sync_state.buffer.shrink_to(SYNC_RETAINED_CAPACITY);
+            }
         }
     }
 
-    /// Number of bytes in the synchronization buffer.
+    /// Returns the number of bytes held by the pending synchronized update.
     #[inline]
     pub fn sync_bytes_count(&self) -> usize {
         self.state.sync_state.buffer.len()
@@ -389,14 +521,19 @@ impl<'a, H: Handler + 'a, T: Timeout> Performer<'a, H, T> {
     }
 }
 
-#[derive(Default)]
+/// The default [`Timeout`]: records the synchronized-update deadline as an [`Instant`].
+///
+/// It never checks the clock on its own; [`Self::sync_timeout`] exposes the deadline for the
+/// caller to enforce.
+#[derive(Debug, Default)]
 pub struct StdSyncHandler {
     timeout: Option<Instant>,
 }
 
 impl StdSyncHandler {
-    /// Synchronized update expiration time.
+    /// Returns the pending synchronized update's deadline, or `None` if none is pending.
     #[inline]
+    #[must_use]
     pub fn sync_timeout(&self) -> Option<Instant> {
         self.timeout
     }
@@ -419,33 +556,41 @@ impl Timeout for StdSyncHandler {
     }
 }
 
-/// Interface for creating timeouts and checking their expiry.
+/// Tracks whether a synchronized update is pending, and its deadline.
 ///
-/// This is internally used by the [`Processor`] to handle synchronized
-/// updates.
+/// The [`Processor`] calls [`Self::set_timeout`] when a synchronized update begins or is
+/// extended and [`Self::clear_timeout`] when it ends. It never checks whether the deadline has
+/// passed: the caller does, and calls [`Processor::stop_sync`] (see the
+/// [module documentation](crate::ansi#synchronized-updates)).
 pub trait Timeout: Default {
-    /// Sets the timeout for the next synchronized update.
+    /// Records that the pending synchronized update must end `duration` from now.
     ///
-    /// The `duration` parameter specifies the duration of the timeout. Once the
-    /// specified duration has elapsed, the synchronized update rotuine can be
-    /// performed.
+    /// Called at the start of an update and again whenever a further BSU extends it.
     fn set_timeout(&mut self, duration: Duration);
-    /// Clear the current timeout.
+
+    /// Records that no synchronized update is pending.
     fn clear_timeout(&mut self);
-    /// Returns whether a timeout is currently active and has not yet expired.
+
+    /// Returns whether a synchronized update is pending.
+    ///
+    /// This must stay `true` from [`Self::set_timeout`] until [`Self::clear_timeout`], even
+    /// after the deadline has passed. While it is `true`, [`Processor::advance`] holds input
+    /// instead of dispatching it; returning `false` early would let new output overtake the
+    /// bytes still held.
     fn pending_timeout(&self) -> bool;
 }
 
-/// Type that handles actions from the parser.
+/// Receives the terminal operations that a [`Processor`] decodes.
 ///
-/// XXX Should probably not provide default impls for everything, but it makes
-/// writing specific handler impls for tests far easier.
+/// Each method corresponds to a control character, escape sequence, or OSC command. Every
+/// method has a no-op default, so an implementation overrides only what it supports.
+/// Positions and sizes are in character cells.
 pub trait Handler {
-    /// OSC to set window title.
-    fn set_title(&mut self, _: Option<String>) {}
+    /// Sets the window title to `title` (OSC 0 and OSC 2); `None` restores the default title.
+    fn set_title(&mut self, _title: Option<String>) {}
 
-    /// Set the cursor style.
-    fn set_cursor_style(&mut self, _: Option<CursorStyle>) {}
+    /// Sets the cursor style (DECSCUSR); `None` restores the default style.
+    fn set_cursor_style(&mut self, _style: Option<CursorStyle>) {}
 
     /// Set the cursor shape.
     fn set_cursor_shape(&mut self, _shape: CursorShape) {}
@@ -470,46 +615,47 @@ pub trait Handler {
         }
     }
 
-    /// Set cursor to position.
+    /// Moves the cursor to zero-based `line` and `col` (CUP, HVP).
     fn goto(&mut self, _line: i32, _col: usize) {}
 
-    /// Set cursor to specific row.
+    /// Moves the cursor to zero-based `line`, keeping its column (VPA).
     fn goto_line(&mut self, _line: i32) {}
 
-    /// Set cursor to specific column.
+    /// Moves the cursor to zero-based `col`, keeping its line (CHA, HPA).
     fn goto_col(&mut self, _col: usize) {}
 
-    /// Insert blank characters in current line starting from cursor.
-    fn insert_blank(&mut self, _: usize) {}
+    /// Inserts `count` blank cells at the cursor, shifting the rest of the line right (ICH).
+    fn insert_blank(&mut self, _count: usize) {}
 
-    /// Move cursor up `rows`.
-    fn move_up(&mut self, _: usize) {}
+    /// Moves the cursor up `rows` lines (CUU).
+    fn move_up(&mut self, _rows: usize) {}
 
-    /// Move cursor down `rows`.
-    fn move_down(&mut self, _: usize) {}
+    /// Moves the cursor down `rows` lines (CUD, VPR).
+    fn move_down(&mut self, _rows: usize) {}
 
     /// Identify the terminal (should write back to the pty stream).
     fn identify_terminal(&mut self, _intermediate: Option<char>) {}
 
-    /// Report device status.
-    fn device_status(&mut self, _: usize) {}
+    /// Answers a device status report request (DSR): `kind` 5 asks for the terminal's status
+    /// and 6 for the cursor position.
+    fn device_status(&mut self, _kind: usize) {}
 
-    /// Move cursor forward `cols`.
-    fn move_forward(&mut self, _col: usize) {}
+    /// Moves the cursor right `cols` columns (CUF, HPR).
+    fn move_forward(&mut self, _cols: usize) {}
 
-    /// Move cursor backward `cols`.
-    fn move_backward(&mut self, _col: usize) {}
+    /// Moves the cursor left `cols` columns (CUB).
+    fn move_backward(&mut self, _cols: usize) {}
 
-    /// Move cursor down `rows` and set to column 1.
-    fn move_down_and_cr(&mut self, _row: usize) {}
+    /// Moves the cursor down `rows` lines and to the first column (CNL).
+    fn move_down_and_cr(&mut self, _rows: usize) {}
 
-    /// Move cursor up `rows` and set to column 1.
-    fn move_up_and_cr(&mut self, _row: usize) {}
+    /// Moves the cursor up `rows` lines and to the first column (CPL).
+    fn move_up_and_cr(&mut self, _rows: usize) {}
 
     /// Put `count` tabs.
     fn put_tab(&mut self, _count: u16) {}
 
-    /// Backspace `count` characters.
+    /// Moves the cursor one column left (BS).
     fn backspace(&mut self) {}
 
     /// Carriage return.
@@ -532,29 +678,29 @@ pub trait Handler {
     /// Set current position as a tabstop.
     fn set_horizontal_tabstop(&mut self) {}
 
-    /// Scroll up `rows` rows.
-    fn scroll_up(&mut self, _: usize) {}
+    /// Scrolls the scrolling region up `rows` lines (SU).
+    fn scroll_up(&mut self, _rows: usize) {}
 
-    /// Scroll down `rows` rows.
-    fn scroll_down(&mut self, _: usize) {}
+    /// Scrolls the scrolling region down `rows` lines (SD).
+    fn scroll_down(&mut self, _rows: usize) {}
 
-    /// Insert `count` blank lines.
-    fn insert_blank_lines(&mut self, _: usize) {}
+    /// Inserts `count` blank lines at the cursor (IL).
+    fn insert_blank_lines(&mut self, _count: usize) {}
 
-    /// Delete `count` lines.
-    fn delete_lines(&mut self, _: usize) {}
+    /// Deletes `count` lines at the cursor (DL).
+    fn delete_lines(&mut self, _count: usize) {}
 
-    /// Erase `count` chars in current line following cursor.
+    /// Erases `count` cells starting at the cursor (ECH).
     ///
     /// Erase means resetting to the default state (default colors, no content,
     /// no mode flags).
-    fn erase_chars(&mut self, _: usize) {}
+    fn erase_chars(&mut self, _count: usize) {}
 
-    /// Delete `count` chars.
+    /// Deletes `count` cells at the cursor (DCH).
     ///
     /// Deleting a character is like the delete key on the keyboard - everything
     /// to the right of the deleted things is shifted left.
-    fn delete_chars(&mut self, _: usize) {}
+    fn delete_chars(&mut self, _count: usize) {}
 
     /// Move backward `count` tabs.
     fn move_backward_tabs(&mut self, _count: u16) {}
@@ -611,41 +757,60 @@ pub trait Handler {
     /// DECRPM - report private mode.
     fn report_private_mode(&mut self, _mode: PrivateMode) {}
 
-    /// DECSTBM - Set the terminal scrolling region.
+    /// Sets the scrolling region (DECSTBM) to one-based lines `top` through `bottom`.
+    ///
+    /// `bottom` is `None` when the sequence omits it or gives 0, meaning the last line.
     fn set_scrolling_region(&mut self, _top: usize, _bottom: Option<usize>) {}
 
-    /// DECKPAM - Set keypad to applications mode (ESCape instead of digits).
+    /// DECKPAM - Set keypad to applications mode (escape sequences instead of digits).
     fn set_keypad_application_mode(&mut self) {}
 
-    /// DECKPNM - Set keypad to numeric mode (digits instead of ESCape seq).
+    /// DECKPNM - Set keypad to numeric mode (digits instead of escape sequences).
     fn unset_keypad_application_mode(&mut self) {}
 
     /// Set one of the graphic character sets, G0 to G3, as the active charset.
     ///
     /// 'Invoke' one of G0 to G3 in the GL area. Also referred to as shift in,
     /// shift out and locking shift depending on the set being activated.
-    fn set_active_charset(&mut self, _: CharsetIndex) {}
+    fn set_active_charset(&mut self, _index: CharsetIndex) {}
 
-    /// Assign a graphic character set to G0, G1, G2 or G3.
+    /// Designates `charset` as the graphic character set `index` (G0 to G3).
     ///
-    /// 'Designate' a graphic character set as one of G0 to G3, so that it can
-    /// later be 'invoked' by `set_active_charset`.
-    fn configure_charset(&mut self, _: CharsetIndex, _: StandardCharset) {}
+    /// A designated set takes effect once it is invoked with
+    /// [`Self::set_active_charset`].
+    fn configure_charset(&mut self, _index: CharsetIndex, _charset: StandardCharset) {}
 
-    /// Set an indexed color value.
-    fn set_color(&mut self, _: usize, _: Rgb) {}
+    /// Sets color slot `index` to `color`.
+    ///
+    /// Slots 0 to 255 are the indexed palette (OSC 4). The dynamic colors (OSC 10 to 12) use the
+    /// slots [`NamedColor::Foreground`], [`NamedColor::Background`], and
+    /// [`NamedColor::Cursor`], cast to `usize`.
+    fn set_color(&mut self, _index: usize, _color: Rgb) {}
 
-    /// Respond to a color query escape sequence.
-    fn dynamic_color_sequence(&mut self, _: String, _: usize, _: &str) {}
+    /// Answers a color query (OSC 4, 10, 11, or 12 with `?`) for color slot `index`.
+    ///
+    /// Slots are numbered as in [`Self::set_color`]. The reply starts with `OSC {prefix};`,
+    /// where `prefix` is the query's own prefix (such as `4;1` or `10`), continues with the color,
+    /// conventionally as `rgb:rrrr/gggg/bbbb`, and ends with `terminator`, which matches the
+    /// query's terminator (BEL or `ESC \`).
+    fn dynamic_color_sequence(&mut self, _prefix: String, _index: usize, _terminator: &str) {}
 
-    /// Reset an indexed color to original value.
-    fn reset_color(&mut self, _: usize) {}
+    /// Resets color slot `index`, numbered as in [`Self::set_color`], to its configured value
+    /// (OSC 104, 110, 111, and 112).
+    fn reset_color(&mut self, _index: usize) {}
 
-    /// Store data into clipboard.
-    fn clipboard_store(&mut self, _: u8, _: &[u8]) {}
+    /// Stores `base64`, an OSC 52 payload exactly as sent, in the selection `clipboard`.
+    ///
+    /// `clipboard` is the first byte of the selection parameter, or `b'c'` when that parameter
+    /// is empty; xterm uses `c` for the clipboard and `p` or `s` for the primary selection. The
+    /// payload is not decoded.
+    fn clipboard_store(&mut self, _clipboard: u8, _base64: &[u8]) {}
 
-    /// Load data from clipboard.
-    fn clipboard_load(&mut self, _: u8, _: &str) {}
+    /// Answers a clipboard query (OSC 52 with `?`) for the selection `clipboard`.
+    ///
+    /// `clipboard` is chosen as for [`Self::clipboard_store`]. The reply should end with
+    /// `terminator`, which matches the query's terminator (BEL or `ESC \`).
+    fn clipboard_load(&mut self, _clipboard: u8, _terminator: &str) {}
 
     /// Run the decaln routine.
     fn decaln(&mut self) {}
@@ -679,11 +844,11 @@ pub trait Handler {
     /// of a cancelled command is incomplete.
     fn apc_end(&mut self, _cancelled: bool) {}
 
-    /// Set hyperlink.
-    fn set_hyperlink(&mut self, _: Option<Hyperlink>) {}
+    /// Starts the hyperlink `link` for the text that follows (OSC 8); `None` ends it.
+    fn set_hyperlink(&mut self, _link: Option<Hyperlink>) {}
 
-    /// Set mouse cursor icon.
-    fn set_mouse_cursor_icon(&mut self, _: CursorIcon) {}
+    /// Sets the mouse pointer shape (OSC 22).
+    fn set_mouse_cursor_icon(&mut self, _icon: CursorIcon) {}
 
     /// Report current keyboard mode.
     fn report_keyboard_mode(&mut self) {}
@@ -717,7 +882,7 @@ bitflags! {
         /// that result in text are reported as plain UTF-8, unless the
         /// [`Self::REPORT_ALL_KEYS_AS_ESC`] is enabled.
         const REPORT_EVENT_TYPES      = 0b0000_0010;
-        /// Additionally report shifted key an dbase layout key.
+        /// Additionally report shifted key and base layout key.
         const REPORT_ALTERNATE_KEYS   = 0b0000_0100;
         /// Report every key as an escape sequence.
         const REPORT_ALL_KEYS_AS_ESC  = 0b0000_1000;
@@ -728,7 +893,7 @@ bitflags! {
 
 /// Describes how the new [`KeyboardModes`] should be applied.
 #[repr(u8)]
-#[derive(Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum KeyboardModesApplyBehavior {
     /// Replace the active flags with the new ones.
     #[default]
@@ -742,7 +907,9 @@ pub enum KeyboardModesApplyBehavior {
 /// Terminal cursor configuration.
 #[derive(Default, Debug, Eq, PartialEq, Copy, Clone, Hash)]
 pub struct CursorStyle {
+    /// The cursor's shape.
     pub shape: CursorShape,
+    /// Whether the cursor blinks.
     pub blinking: bool,
 }
 
@@ -771,7 +938,7 @@ pub enum CursorShape {
 pub enum Mode {
     /// Known ANSI mode.
     Named(NamedMode),
-    /// Unidentified publc mode.
+    /// Unidentified public mode.
     Unknown(u16),
 }
 
@@ -785,6 +952,7 @@ impl Mode {
     }
 
     /// Get the raw value of the mode.
+    #[must_use]
     pub fn raw(self) -> u16 {
         match self {
             Self::Named(named) => named as u16,
@@ -805,6 +973,7 @@ impl From<NamedMode> for Mode {
 pub enum NamedMode {
     /// IRM Insert Mode.
     Insert = 4,
+    /// LNM Line Feed/New Line Mode: line feeds also return the cursor to the first column.
     LineFeedNewLine = 20,
 }
 
@@ -842,6 +1011,7 @@ impl PrivateMode {
     }
 
     /// Get the raw value of the mode.
+    #[must_use]
     pub fn raw(self) -> u16 {
         match self {
             Self::Named(named) => named as u16,
@@ -859,6 +1029,7 @@ impl From<NamedPrivateMode> for PrivateMode {
 /// Private DEC modes.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum NamedPrivateMode {
+    /// Cursor keys send application sequences instead of ANSI ones (DECCKM).
     CursorKeys = 1,
     /// Select 80 or 132 columns per page (DECCOLM).
     ///
@@ -872,21 +1043,35 @@ pub enum NamedPrivateMode {
     /// * resets DECLRMM to unavailable
     /// * clears data from the status line (if set to host-writable)
     ColumnMode = 3,
+    /// Cursor positions are relative to the scrolling region (DECOM).
     Origin = 6,
+    /// Text wraps to the next line at the right margin (DECAWM).
     LineWrap = 7,
+    /// The cursor blinks.
     BlinkingCursor = 12,
+    /// The cursor is visible (DECTCEM).
     ShowCursor = 25,
+    /// Report mouse button presses and releases.
     ReportMouseClicks = 1000,
+    /// Also report mouse motion while a button is held.
     ReportCellMouseMotion = 1002,
+    /// Report all mouse motion.
     ReportAllMouseMotion = 1003,
+    /// Report when the terminal gains or loses focus.
     ReportFocusInOut = 1004,
+    /// Encode mouse reports as UTF-8.
     Utf8Mouse = 1005,
+    /// Encode mouse reports in the SGR format.
     SgrMouse = 1006,
+    /// In the alternate screen, the mouse wheel sends cursor keys.
     AlternateScroll = 1007,
+    /// The bell sets the window's urgency hint.
     UrgencyHints = 1042,
+    /// Switch to the alternate screen, saving and restoring the cursor.
     SwapScreenAndSetRestoreCursor = 1049,
+    /// Pasted text is wrapped in bracketed-paste markers.
     BracketedPaste = 2004,
-    /// The mode is handled automatically by [`Processor`].
+    /// Synchronized updates; the [`Processor`] handles this mode itself.
     SyncUpdate = 2026,
 }
 
@@ -995,6 +1180,9 @@ pub enum NamedColor {
 }
 
 impl NamedColor {
+    /// Returns the next brighter variant: dim colors become normal, normal colors bright.
+    ///
+    /// Bright colors and colors without variants are returned unchanged.
     #[must_use]
     pub fn to_bright(self) -> Self {
         match self {
@@ -1020,6 +1208,9 @@ impl NamedColor {
         }
     }
 
+    /// Returns the next dimmer variant: bright colors become normal, normal colors dim.
+    ///
+    /// Dim colors and colors without variants are returned unchanged.
     #[must_use]
     pub fn to_dim(self) -> Self {
         match self {
@@ -1046,11 +1237,15 @@ impl NamedColor {
     }
 }
 
+/// A color as set by SGR.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum Color {
+    /// One of the terminal's named colors.
     Named(NamedColor),
+    /// A direct 24-bit color.
     Spec(Rgb),
+    /// An entry of the 256-color palette.
     Indexed(u8),
 }
 
@@ -1115,16 +1310,21 @@ pub enum CharsetIndex {
     /// Default set, is designated as ASCII at startup.
     #[default]
     G0,
+    /// The G1 set, invoked by shift out (SO).
     G1,
+    /// The G2 set.
     G2,
+    /// The G3 set.
     G3,
 }
 
 /// Standard or common character sets which can be designated as G0-G3.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum StandardCharset {
+    /// US ASCII.
     #[default]
     Ascii,
+    /// The DEC Special Character and Line Drawing Set.
     SpecialCharacterAndLineDrawing,
 }
 
@@ -1132,6 +1332,7 @@ impl StandardCharset {
     /// Switch/Map character to the active charset. Ascii is the common case and
     /// for that we want to do as little as possible.
     #[inline]
+    #[must_use]
     pub fn map(self, c: char) -> char {
         match self {
             StandardCharset::Ascii => c,
@@ -1223,26 +1424,33 @@ where
             C0::SUB => self.handler.substitute(),
             C0::SI => self.handler.set_active_charset(CharsetIndex::G0),
             C0::SO => self.handler.set_active_charset(CharsetIndex::G1),
-            _ => debug!("[unhandled] execute byte={:02x}", byte),
+            _ => debug!(
+                event = "vvte.execute.unhandled",
+                byte;
+                "unhandled control byte {byte:#04x}"
+            ),
         }
     }
+
+    // DCS strings are not handled. Their data bytes, passed to `put` one at a time, are dropped
+    // without logging: a single image can be megabytes.
 
     #[inline]
     fn hook(&mut self, params: &Params, intermediates: &[u8], ignore: bool, action: char) {
         debug!(
-            "[unhandled hook] params={:?}, ints: {:?}, ignore: {:?}, action: {:?}",
-            params, intermediates, ignore, action
+            event = "vvte.dcs.unhandled",
+            params:?,
+            intermediates:% = intermediates.escape_ascii(),
+            ignore,
+            action:?;
+            "unhandled DCS {}{action}",
+            intermediates.escape_ascii()
         );
     }
 
     #[inline]
-    fn put(&mut self, byte: u8) {
-        debug!("[unhandled put] byte={:?}", byte);
-    }
-
-    #[inline]
     fn unhook(&mut self) {
-        debug!("[unhandled unhook]");
+        debug!(event = "vvte.dcs.end"; "end of unhandled DCS");
     }
 
     #[inline]
@@ -1261,28 +1469,24 @@ where
     }
 
     #[inline]
+    #[expect(clippy::too_many_lines, reason = "one arm per OSC command, like the dispatch table")]
     fn osc_dispatch(&mut self, params: &[&[u8]], bell_terminated: bool) {
-        let terminator = if bell_terminated { "\x07" } else { "\x1b\\" };
-
+        // The parameters can carry user data, such as clipboard contents or paths, so they go in
+        // a field, which loggers can redact, and only the command number goes in the message.
+        // Both are formatted only if the record is written.
         #[cold]
         #[inline(never)]
         fn unhandled(params: &[&[u8]]) {
-            if log::LevelFilter::Debug > log::STATIC_MAX_LEVEL
-                || log::LevelFilter::Debug > log::max_level()
-            {
-                return;
-            }
-
-            let mut buf = String::new();
-            for items in params {
-                buf.push('[');
-                for item in *items {
-                    let _ = write!(buf, "{:?}", *item as char);
-                }
-                buf.push_str("],");
-            }
-            debug!("[unhandled osc_dispatch]: [{buf}] at line {}", line!());
+            let command = params.first().copied().unwrap_or_default();
+            debug!(
+                event = "vvte.osc.unhandled",
+                params:% = OscParams(params);
+                "unhandled OSC {}",
+                command.escape_ascii()
+            );
         }
+
+        let terminator = if bell_terminated { "\x07" } else { "\x1b\\" };
 
         if params.is_empty() || params[0].is_empty() {
             return;
@@ -1324,12 +1528,9 @@ where
                 }
 
                 for chunk in params[1..].chunks(2) {
-                    let index = match parse_number(chunk[0]) {
-                        Some(index) => index,
-                        None => {
-                            unhandled(params);
-                            continue;
-                        },
+                    let Some(index) = parse_number(chunk[0]) else {
+                        unhandled(params);
+                        continue;
                     };
 
                     if let Some(c) = xparse_color(chunk[1]) {
@@ -1369,7 +1570,7 @@ where
                 let id = link_params
                     .split(|&b| b == b':')
                     .find_map(|kv| kv.strip_prefix(b"id="))
-                    .and_then(|kv| str::from_utf8(kv).ok().map(|e| e.to_owned()));
+                    .and_then(|kv| str::from_utf8(kv).ok().map(str::to_owned));
 
                 self.handler.set_hyperlink(Some(Hyperlink { id, uri }));
             },
@@ -1413,7 +1614,11 @@ where
                 let shape = String::from_utf8_lossy(params[1]);
                 match CursorIcon::from_str(&shape) {
                     Ok(cursor_icon) => self.handler.set_mouse_cursor_icon(cursor_icon),
-                    Err(_) => debug!("[osc 22] unrecognized cursor icon shape: {shape:?}"),
+                    Err(_) => debug!(
+                        event = "vvte.osc22.unknown_shape",
+                        shape:%;
+                        "unrecognized OSC 22 cursor shape"
+                    ),
                 }
             },
 
@@ -1480,8 +1685,8 @@ where
         }
     }
 
-    #[allow(clippy::cognitive_complexity)]
     #[inline]
+    #[expect(clippy::too_many_lines, reason = "one arm per CSI sequence, like the dispatch table")]
     fn csi_dispatch(
         &mut self,
         params: &Params,
@@ -1492,8 +1697,14 @@ where
         macro_rules! unhandled {
             () => {{
                 debug!(
-                    "[Unhandled CSI] action={:?}, params={:?}, intermediates={:?}",
-                    action, params, intermediates
+                    event = "vvte.csi.unhandled",
+                    params:?,
+                    intermediates:% = intermediates.escape_ascii(),
+                    action:?;
+                    "unhandled CSI {:?}{}{}",
+                    params,
+                    intermediates.escape_ascii(),
+                    action
                 );
             }};
         }
@@ -1504,7 +1715,7 @@ where
         }
 
         let mut params_iter = params.iter();
-        let handler = &mut self.handler;
+        let handler = &mut *self.handler;
 
         let mut next_param_or = |default: u16| match params_iter.next() {
             Some(&[param, ..]) if param != 0 => param,
@@ -1514,23 +1725,23 @@ where
         match (action, intermediates) {
             ('@', []) => handler.insert_blank(next_param_or(1) as usize),
             ('A', []) => handler.move_up(next_param_or(1) as usize),
-            ('B', []) | ('e', []) => handler.move_down(next_param_or(1) as usize),
+            ('B' | 'e', []) => handler.move_down(next_param_or(1) as usize),
             ('b', []) => {
                 if let Some(c) = self.state.preceding_char {
                     handler.repeat_char(c, usize::from(next_param_or(1)));
                 } else {
-                    debug!("tried to repeat with no preceding char");
+                    debug!(event = "vvte.rep.no_preceding_char"; "REP without a preceding character");
                 }
             },
-            ('C', []) | ('a', []) => handler.move_forward(next_param_or(1) as usize),
+            ('C' | 'a', []) => handler.move_forward(next_param_or(1) as usize),
             ('c', intermediates) if next_param_or(0) == 0 => {
-                handler.identify_terminal(intermediates.first().map(|&i| i as char))
+                handler.identify_terminal(intermediates.first().map(|&i| i as char));
             },
             ('D', []) => handler.move_backward(next_param_or(1) as usize),
-            ('d', []) => handler.goto_line(next_param_or(1) as i32 - 1),
+            ('d', []) => handler.goto_line(i32::from(next_param_or(1)) - 1),
             ('E', []) => handler.move_down_and_cr(next_param_or(1) as usize),
             ('F', []) => handler.move_up_and_cr(next_param_or(1) as usize),
-            ('G', []) | ('`', []) => handler.goto_col(next_param_or(1) as usize - 1),
+            ('G' | '`', []) => handler.goto_col(next_param_or(1) as usize - 1),
             ('W', [b'?']) if next_param_or(0) == 5 => handler.set_tabs(8),
             ('g', []) => {
                 let mode = match next_param_or(0) {
@@ -1544,14 +1755,14 @@ where
 
                 handler.clear_tabs(mode);
             },
-            ('H', []) | ('f', []) => {
-                let y = next_param_or(1) as i32;
+            ('H' | 'f', []) => {
+                let y = i32::from(next_param_or(1));
                 let x = next_param_or(1) as usize;
                 handler.goto(y - 1, x - 1);
             },
             ('h', []) => {
                 for param in params_iter.map(|param| param[0]) {
-                    handler.set_mode(Mode::new(param))
+                    handler.set_mode(Mode::new(param));
                 }
             },
             ('h', [b'?']) => {
@@ -1562,7 +1773,7 @@ where
                         self.terminated = true;
                     }
 
-                    handler.set_private_mode(PrivateMode::new(param))
+                    handler.set_private_mode(PrivateMode::new(param));
                 }
             },
             ('I', []) => handler.move_forward_tabs(next_param_or(1)),
@@ -1596,12 +1807,12 @@ where
             ('L', []) => handler.insert_blank_lines(next_param_or(1) as usize),
             ('l', []) => {
                 for param in params_iter.map(|param| param[0]) {
-                    handler.unset_mode(Mode::new(param))
+                    handler.unset_mode(Mode::new(param));
                 }
             },
             ('l', [b'?']) => {
                 for param in params_iter.map(|param| param[0]) {
-                    handler.unset_private_mode(PrivateMode::new(param))
+                    handler.unset_private_mode(PrivateMode::new(param));
                 }
             },
             ('M', []) => handler.delete_lines(next_param_or(1) as usize),
@@ -1609,7 +1820,7 @@ where
                 if params.is_empty() {
                     handler.terminal_attribute(Attr::Reset);
                 } else {
-                    attrs_from_sgr_parameters(*handler, &mut params_iter);
+                    attrs_from_sgr_parameters(handler, &mut params_iter);
                 }
             },
             ('n', []) => handler.device_status(next_param_or(0) as usize),
@@ -1660,7 +1871,12 @@ where
             },
             ('u', [b'?']) => handler.report_keyboard_mode(),
             ('u', [b'=']) => {
-                let mode = KeyboardModes::from_bits_truncate(next_param_or(0) as u8);
+                // Flags that do not fit the protocol's flag byte are rejected, not truncated.
+                let Ok(flags) = u8::try_from(next_param_or(0)) else {
+                    unhandled!();
+                    return;
+                };
+                let mode = KeyboardModes::from_bits_truncate(flags);
                 let behavior = match next_param_or(1) {
                     3 => KeyboardModesApplyBehavior::Difference,
                     2 => KeyboardModesApplyBehavior::Union,
@@ -1670,8 +1886,11 @@ where
                 handler.set_keyboard_mode(mode, behavior);
             },
             ('u', [b'>']) => {
-                let mode = KeyboardModes::from_bits_truncate(next_param_or(0) as u8);
-                handler.push_keyboard_mode(mode);
+                let Ok(flags) = u8::try_from(next_param_or(0)) else {
+                    unhandled!();
+                    return;
+                };
+                handler.push_keyboard_mode(KeyboardModes::from_bits_truncate(flags));
             },
             ('u', [b'<']) => {
                 // The default is 1.
@@ -1689,8 +1908,12 @@ where
         macro_rules! unhandled {
             () => {{
                 debug!(
-                    "[unhandled] esc_dispatch ints={:?}, byte={:?} ({:02x})",
-                    intermediates, byte as char, byte
+                    event = "vvte.esc.unhandled",
+                    intermediates:% = intermediates.escape_ascii(),
+                    byte;
+                    "unhandled ESC {}{}",
+                    intermediates.escape_ascii(),
+                    byte.escape_ascii()
                 );
             }};
         }
@@ -1723,7 +1946,7 @@ where
             (b'Z', []) => self.handler.identify_terminal(None),
             (b'c', []) => self.handler.reset_state(),
             (b'0', intermediates) => {
-                configure_charset!(StandardCharset::SpecialCharacterAndLineDrawing, intermediates)
+                configure_charset!(StandardCharset::SpecialCharacterAndLineDrawing, intermediates);
             },
             (b'7', []) => self.handler.save_cursor_position(),
             (b'8', [b'#']) => self.handler.decaln(),
@@ -1824,10 +2047,24 @@ fn attrs_from_sgr_parameters<H: Handler>(handler: &mut H, params: &mut ParamsIte
             _ => None,
         };
 
-        match attr {
-            Some(attr) => handler.terminal_attribute(attr),
-            None => continue,
+        if let Some(attr) = attr {
+            handler.terminal_attribute(attr);
         }
+    }
+}
+
+/// OSC parameters rendered for diagnostics as they were sent, `;`-separated and ASCII-escaped.
+struct OscParams<'a>(&'a [&'a [u8]]);
+
+impl fmt::Display for OscParams<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (i, param) in self.0.iter().enumerate() {
+            if i != 0 {
+                f.write_str(";")?;
+            }
+            write!(f, "{}", param.escape_ascii())?;
+        }
+        Ok(())
     }
 }
 
@@ -1856,7 +2093,7 @@ fn parse_sgr_color<I: Iterator<Item = u16>>(params: &mut I) -> Option<Color> {
 }
 
 /// C0 control characters dispatched by the processor (from ANSI X3.4-1977).
-#[allow(non_snake_case)]
+#[expect(non_snake_case, reason = "named after the C0 control set it holds")]
 mod C0 {
     /// Bell, triggers the bell, buzzer, or beeper on the terminal.
     pub const BEL: u8 = 0x07;
@@ -1989,7 +2226,7 @@ mod tests {
         }
 
         fn reset_color(&mut self, index: usize) {
-            self.reset_colors.push(index)
+            self.reset_colors.push(index);
         }
 
         fn goto(&mut self, line: i32, col: usize) {
@@ -2185,6 +2422,21 @@ mod tests {
     fn parse_invalid_legacy_rgb_colors() {
         assert_eq!(xparse_color(b"#"), None);
         assert_eq!(xparse_color(b"#f"), None);
+        assert_eq!(xparse_color(b"#+f+f+f"), None, "signs are not hex digits");
+    }
+
+    /// A channel of 17 or more digits, possible with leading zeros, overflowed the shift that
+    /// kept its top digits: debug builds panicked and release builds returned the wrong color.
+    #[test]
+    fn long_legacy_colors_keep_their_top_digits() {
+        let channel = |top: &str| format!("{top}{}", "0".repeat(15));
+        let color = format!("#{}{}{}", channel("ab"), channel("00"), channel("f1"));
+        assert_eq!(xparse_color(color.as_bytes()), Some(Rgb { r: 0xAB, g: 0x00, b: 0xF1 }));
+
+        let osc = format!("\x1b]4;0;{color}\x07");
+        let mut handler = MockHandler::default();
+        Processor::<TestSyncHandler>::new().advance(&mut handler, osc.as_bytes());
+        assert_eq!(handler.color, Some(Rgb { r: 0xAB, g: 0x00, b: 0xF1 }));
     }
 
     #[test]
@@ -2323,6 +2575,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "feeds 4 MiB, which is too slow under Miri")]
     fn sync_bursts_buffer() {
         let mut parser = Processor::<TestSyncHandler>::new();
         let mut handler = MockHandler::default();
@@ -2355,6 +2608,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "feeds 256 KiB through the sync buffer, too slow under Miri")]
     fn the_sync_buffer_is_grown_on_demand_and_handed_back() {
         // Every `Processor` used to reserve SYNC_BUFFER_SIZE at construction, so a pane that never
         // saw a synchronized update still paid 2MiB for one.
@@ -2434,19 +2688,26 @@ mod tests {
 
     #[test]
     fn contrast() {
-        let rgb1 = Rgb { r: 0xFF, g: 0xFF, b: 0xFF };
-        let rgb2 = Rgb { r: 0x00, g: 0x00, b: 0x00 };
-        assert!((rgb1.contrast(rgb2) - 21.).abs() < f64::EPSILON);
+        // `powf` may differ in its last bits between math libraries, and Miri perturbs it on
+        // purpose, so compare to a relative tolerance far above that noise.
+        fn assert_close(actual: f64, expected: f64) {
+            let error = (actual - expected).abs() / expected;
+            assert!(error < 1e-12, "contrast {actual} differs from {expected}");
+        }
 
         let rgb1 = Rgb { r: 0xFF, g: 0xFF, b: 0xFF };
-        assert!((rgb1.contrast(rgb1) - 1.).abs() < f64::EPSILON);
+        let rgb2 = Rgb { r: 0x00, g: 0x00, b: 0x00 };
+        assert_close(rgb1.contrast(rgb2), 21.);
+
+        let rgb1 = Rgb { r: 0xFF, g: 0xFF, b: 0xFF };
+        assert_close(rgb1.contrast(rgb1), 1.);
 
         let rgb1 = Rgb { r: 0xFF, g: 0x00, b: 0xFF };
         let rgb2 = Rgb { r: 0x00, g: 0xFF, b: 0x00 };
-        assert!((rgb1.contrast(rgb2) - 2.285_543_608_124_253_3).abs() < f64::EPSILON);
+        assert_close(rgb1.contrast(rgb2), 2.285_543_608_124_253_3);
 
         let rgb1 = Rgb { r: 0x12, g: 0x34, b: 0x56 };
         let rgb2 = Rgb { r: 0xFE, g: 0xDC, b: 0xBA };
-        assert!((rgb1.contrast(rgb2) - 9.786_558_997_257_74).abs() < f64::EPSILON);
+        assert_close(rgb1.contrast(rgb2), 9.786_558_997_257_74);
     }
 }

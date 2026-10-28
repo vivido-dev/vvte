@@ -7,6 +7,8 @@ description = "Terminal stream parser for Vivido and related projects"
 readme = "README.md"
 repository = "https://github.com/vivido-dev/vvte"
 license = "Apache-2.0 OR MIT"
+keywords = ["terminal", "vte", "ansi", "escape", "parser"]
+categories = ["parser-implementations", "command-line-interface"]
 # Derived from vte 0.15.0, upstream revision 3b3da71c34cc1256c7e20981cf03f8eb95e08ffc.
 # src/ansi.rs retains its upstream Apache-2.0 license notice.
 
@@ -22,6 +24,58 @@ serde = ["dep:serde"]
 [dependencies]
 bitflags = { version = "2.13", default-features = false, optional = true }
 cursor-icon = { version = "1.2", default-features = false, optional = true }
-log = { version = "0.4", optional = true }
+# `kv` carries diagnostics as named fields; it adds no dependencies.
+log = { version = "0.4.29", features = ["kv"], optional = true }
 memchr = { version = "2.8", default-features = false }
 serde = { version = "1", features = ["derive"], optional = true }
+
+[lints.rust]
+ambiguous_negative_literals = "warn"
+missing_debug_implementations = "warn"
+missing_docs = "warn"
+redundant_imports = "warn"
+redundant_lifetimes = "warn"
+trivial_numeric_casts = "warn"
+unsafe_op_in_unsafe_fn = "warn"
+unused_lifetimes = "warn"
+
+[lints.clippy]
+cargo = { level = "warn", priority = -1 }
+complexity = { level = "warn", priority = -1 }
+correctness = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+style = { level = "warn", priority = -1 }
+suspicious = { level = "warn", priority = -1 }
+
+allow_attributes_without_reason = "warn"
+as_pointer_underscore = "warn"
+assertions_on_result_states = "warn"
+clone_on_ref_ptr = "warn"
+deref_by_slicing = "warn"
+disallowed_script_idents = "warn"
+empty_drop = "warn"
+empty_enum_variants_with_brackets = "warn"
+empty_structs_with_brackets = "warn"
+fn_to_numeric_cast_any = "warn"
+if_then_some_else_none = "warn"
+map_err_ignore = "warn"
+redundant_type_annotations = "warn"
+renamed_function_params = "warn"
+semicolon_outside_block = "warn"
+too_long_first_doc_paragraph = "warn"
+undocumented_unsafe_blocks = "warn"
+unnecessary_safety_comment = "warn"
+unnecessary_safety_doc = "warn"
+unneeded_field_pattern = "warn"
+unused_result_ok = "warn"
+
+# Structured log messages are plain text next to their fields.
+literal_string_with_formatting_args = "allow"
+
+# The per-byte state handlers are forced inline into the dispatch loop on purpose, so that
+# advancing one byte costs no call.
+inline_always = "allow"
+# The state handlers and the SGR table list cases in specification order; merging arms that
+# share an action would scatter that order and make the tables harder to check.
+match_same_arms = "allow"

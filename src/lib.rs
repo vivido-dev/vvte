@@ -1,28 +1,52 @@
-//! Parser for implementing virtual terminal emulators
+//! Parser for implementing virtual terminal emulators.
 //!
-//! [`Parser`] is implemented according to [Paul Williams' ANSI parser state
-//! machine]. The state machine doesn't assign meaning to the parsed data and is
-//! thus not itself sufficient for writing a terminal emulator. Instead, it is
-//! expected that an implementation of [`Perform`] is provided which does
-//! something useful with the parsed data. The [`Parser`] handles the book
-//! keeping, and the [`Perform`] gets to simply handle actions.
+//! [`Parser`] implements [Paul Williams' ANSI parser state machine]. The state machine assigns
+//! no meaning to the bytes it parses, so it is not a terminal emulator by itself: it reports
+//! each action to an implementation of [`Perform`], which decides what the action means.
 //!
-//! Derived from VTE 0.15.0 for Vivido and related projects. This crate keeps the
-//! standard-library parser and optional ANSI/Serde support. Unsupported OSC
-//! diagnostics are formatted only when debug logging is enabled.
+//! The optional `ansi` feature adds the `ansi` module, whose `Processor` turns these actions
+//! into calls on a higher-level `Handler` trait: cursor movement, colors, modes, and so on.
 //!
-//! # Differences from original state machine description
+//! # Differences from the original state machine
 //!
-//! * UTF-8 Support for Input
-//! * OSC Strings can be terminated by 0x07
-//! * Only supports 7-bit codes
+//! * Input is decoded as UTF-8, including code points split across [`Parser::advance`] calls.
+//!   C1 controls arrive as UTF-8 and are passed to [`Perform::execute`].
+//! * Only 7-bit escape sequences are recognized.
+//! * OSC strings can also be terminated by BEL (`0x07`).
+//! * Application program commands (`ESC _`) are delivered through [`Perform::apc_start`],
+//!   [`Perform::apc_put`], and [`Perform::apc_end`] instead of being ignored.
+//! * [`Perform::osc_capture`] can reject an OSC body once its command is known, and a body
+//!   longer than 8 MiB is discarded rather than buffered (see [`Perform::osc_dispatch`]).
 //!
-//! [`Parser`]: struct.Parser.html
-//! [`Perform`]: trait.Perform.html
+//! # Examples
+//!
+//! ```
+//! use vvte::{Parser, Perform};
+//!
+//! #[derive(Default)]
+//! struct Printer(String);
+//!
+//! impl Perform for Printer {
+//!     fn print(&mut self, c: char) {
+//!         self.0.push(c);
+//!     }
+//!
+//!     fn execute(&mut self, byte: u8) {
+//!         if byte == b'\n' {
+//!             self.0.push('\n');
+//!         }
+//!     }
+//! }
+//!
+//! let mut parser: Parser = Parser::default();
+//! let mut printer = Printer::default();
+//! parser.advance(&mut printer, b"hello \x1b[1mworld\x1b[0m\r\n");
+//! assert_eq!(printer.0, "hello world\n");
+//! ```
+//!
 //! [Paul Williams' ANSI parser state machine]: https://vt100.net/emu/dec_ansi_parser
-#![deny(clippy::all, clippy::if_not_else, clippy::enum_glob_use)]
 
-use core::str;
+use core::{fmt, str};
 
 mod params;
 
@@ -33,12 +57,27 @@ pub use params::{Params, ParamsIter};
 const MAX_INTERMEDIATES: usize = 2;
 const MAX_OSC_PARAMS: usize = 16;
 
-/// Parser for raw _VTE_ protocol which delegates actions to a [`Perform`]
+/// Longest OSC body, in bytes, that the parser buffers.
 ///
-/// [`Perform`]: trait.Perform.html
+/// The body is everything between `ESC ]` and the terminator, without its `;` separators. A
+/// body that would grow past this is discarded and never dispatched, so a program that never
+/// terminates an OSC cannot make the parser hold unbounded memory. 8 MiB admits OSC 52 clipboard
+/// writes of about 6 MiB of text after base64 expansion; titles, colors, and hyperlinks need a
+/// few kilobytes at most. Raising it raises the memory any program on the terminal can pin.
+const MAX_OSC_LEN: usize = 8 * 1024 * 1024;
+
+/// OSC buffer capacity kept after a command ends (64 KiB).
 ///
-/// The const parameter preserves upstream parser type specialization. OSC data
-/// uses a growable buffer; the parameter does not impose a size limit.
+/// Ordinary commands fit comfortably and never reallocate. The capacity a large clipboard write
+/// needed is handed back instead of being held for the life of the parser.
+const OSC_RETAINED_CAPACITY: usize = 64 * 1024;
+
+/// Parser for the raw VTE protocol that delegates actions to a [`Perform`].
+///
+/// A parser holds the state of one byte stream, so each terminal needs its own. Bytes can be fed
+/// in chunks of any size; sequences and UTF-8 code points split between chunks are reassembled.
+///
+/// The const parameter has no effect: OSC bodies grow on demand up to 8 MiB whatever its value.
 #[derive(Default)]
 pub struct Parser<const OSC_RAW_BUF_SIZE: usize = 1024> {
     state: State,
@@ -71,11 +110,34 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
         &self.intermediates[..self.intermediate_idx]
     }
 
-    /// Advance the parser state.
+    /// Parses `bytes` and reports the resulting actions to `performer`.
     ///
-    /// Requires a [`Perform`] implementation to handle the triggered actions.
+    /// `bytes` can end anywhere, including inside an escape sequence or a UTF-8 code point; the
+    /// parser keeps the partial state and resumes with the next call. Feeding a stream in one
+    /// call or in many produces the same actions.
     ///
-    /// [`Perform`]: trait.Perform.html
+    /// # Examples
+    ///
+    /// ```
+    /// use vvte::{Params, Parser, Perform};
+    ///
+    /// #[derive(Default)]
+    /// struct Sgr(Vec<Vec<u16>>);
+    ///
+    /// impl Perform for Sgr {
+    ///     fn csi_dispatch(&mut self, params: &Params, _: &[u8], _: bool, action: char) {
+    ///         if action == 'm' {
+    ///             self.0.extend(params.iter().map(<[u16]>::to_vec));
+    ///         }
+    ///     }
+    /// }
+    ///
+    /// let mut parser: Parser = Parser::default();
+    /// let mut sgr = Sgr::default();
+    /// parser.advance(&mut sgr, b"\x1b[1;38:2:255:0");
+    /// parser.advance(&mut sgr, b":0m");
+    /// assert_eq!(sgr.0, [vec![1], vec![38, 2, 255, 0, 0]]);
+    /// ```
     #[inline]
     pub fn advance<P: Perform>(&mut self, performer: &mut P, bytes: &[u8]) {
         let mut i = 0;
@@ -107,7 +169,7 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
     /// the only caller.
     #[cfg(feature = "ansi")]
     #[inline]
-    #[must_use = "Returned value should be used to processs the remaining bytes"]
+    #[must_use = "Returned value should be used to process the remaining bytes"]
     pub(crate) fn advance_until_terminated<P: Perform>(
         &mut self,
         performer: &mut P,
@@ -167,23 +229,23 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
             0x00..=0x17 | 0x19 | 0x1C..=0x1F => performer.execute(byte),
             0x20..=0x2F => {
                 self.action_collect(byte);
-                self.state = State::CsiIntermediate
+                self.state = State::CsiIntermediate;
             },
             0x30..=0x39 => {
                 self.action_paramnext(byte);
-                self.state = State::CsiParam
+                self.state = State::CsiParam;
             },
             0x3A => {
                 self.action_subparam();
-                self.state = State::CsiParam
+                self.state = State::CsiParam;
             },
             0x3B => {
                 self.action_param();
-                self.state = State::CsiParam
+                self.state = State::CsiParam;
             },
             0x3C..=0x3F => {
                 self.action_collect(byte);
-                self.state = State::CsiParam
+                self.state = State::CsiParam;
             },
             0x40..=0x7E => self.action_csi_dispatch(performer, byte),
             _ => self.anywhere(performer, byte),
@@ -245,7 +307,7 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
             0x00..=0x17 | 0x19 | 0x1C..=0x1F => performer.execute(byte),
             0x20..=0x2F => {
                 self.action_collect(byte);
-                self.state = State::CsiIntermediate
+                self.state = State::CsiIntermediate;
             },
             0x30..=0x39 => self.action_paramnext(byte),
             0x3A => self.action_subparam(),
@@ -263,23 +325,23 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
             0x00..=0x17 | 0x19 | 0x1C..=0x1F => (),
             0x20..=0x2F => {
                 self.action_collect(byte);
-                self.state = State::DcsIntermediate
+                self.state = State::DcsIntermediate;
             },
             0x30..=0x39 => {
                 self.action_paramnext(byte);
-                self.state = State::DcsParam
+                self.state = State::DcsParam;
             },
             0x3A => {
                 self.action_subparam();
-                self.state = State::DcsParam
+                self.state = State::DcsParam;
             },
             0x3B => {
                 self.action_param();
-                self.state = State::DcsParam
+                self.state = State::DcsParam;
             },
             0x3C..=0x3F => {
                 self.action_collect(byte);
-                self.state = State::DcsParam
+                self.state = State::DcsParam;
             },
             0x40..=0x7E => self.action_hook(performer, byte),
             0x7F => (),
@@ -305,7 +367,7 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
             0x00..=0x17 | 0x19 | 0x1C..=0x1F => (),
             0x20..=0x2F => {
                 self.action_collect(byte);
-                self.state = State::DcsIntermediate
+                self.state = State::DcsIntermediate;
             },
             0x30..=0x39 => self.action_paramnext(byte),
             0x3A => self.action_subparam(),
@@ -324,17 +386,17 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
             0x18 | 0x1A => {
                 performer.unhook();
                 performer.execute(byte);
-                self.state = State::Ground
+                self.state = State::Ground;
             },
             0x1B => {
                 performer.unhook();
                 self.reset_params();
-                self.state = State::Escape
+                self.state = State::Escape;
             },
             0x7F => (),
             0x9C => {
                 performer.unhook();
-                self.state = State::Ground
+                self.state = State::Ground;
             },
             _ => (),
         }
@@ -346,52 +408,52 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
             0x00..=0x17 | 0x19 | 0x1C..=0x1F => performer.execute(byte),
             0x20..=0x2F => {
                 self.action_collect(byte);
-                self.state = State::EscapeIntermediate
+                self.state = State::EscapeIntermediate;
             },
             0x30..=0x4F => {
                 performer.esc_dispatch(self.intermediates(), self.ignoring, byte);
-                self.state = State::Ground
+                self.state = State::Ground;
             },
             0x50 => {
                 self.reset_params();
-                self.state = State::DcsEntry
+                self.state = State::DcsEntry;
             },
             0x51..=0x57 => {
                 performer.esc_dispatch(self.intermediates(), self.ignoring, byte);
-                self.state = State::Ground
+                self.state = State::Ground;
             },
             0x58 => self.state = State::SosPmApcString,
             0x59..=0x5A => {
                 performer.esc_dispatch(self.intermediates(), self.ignoring, byte);
-                self.state = State::Ground
+                self.state = State::Ground;
             },
             0x5B => {
                 self.reset_params();
-                self.state = State::CsiEntry
+                self.state = State::CsiEntry;
             },
             0x5C => {
                 performer.esc_dispatch(self.intermediates(), self.ignoring, byte);
-                self.state = State::Ground
+                self.state = State::Ground;
             },
             0x5D => {
                 self.osc_discard = false;
                 self.osc_raw.clear();
                 self.osc_num_params = 0;
-                self.state = State::OscString
+                self.state = State::OscString;
             },
             0x5E => self.state = State::SosPmApcString,
             0x5F => {
                 performer.apc_start();
-                self.state = State::ApcString
+                self.state = State::ApcString;
             },
             0x60..=0x7E => {
                 performer.esc_dispatch(self.intermediates(), self.ignoring, byte);
-                self.state = State::Ground
+                self.state = State::Ground;
             },
             // Anywhere.
             0x18 | 0x1A => {
                 performer.execute(byte);
-                self.state = State::Ground
+                self.state = State::Ground;
             },
             0x1B => (),
             _ => (),
@@ -405,7 +467,7 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
             0x20..=0x2F => self.action_collect(byte),
             0x30..=0x7E => {
                 performer.esc_dispatch(self.intermediates(), self.ignoring, byte);
-                self.state = State::Ground
+                self.state = State::Ground;
             },
             0x7F => (),
             _ => self.anywhere(performer, byte),
@@ -418,17 +480,17 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
             0x00..=0x06 | 0x08..=0x17 | 0x19 | 0x1C..=0x1F => (),
             0x07 => {
                 self.osc_end(performer, byte);
-                self.state = State::Ground
+                self.state = State::Ground;
             },
             0x18 | 0x1A => {
                 self.osc_end(performer, byte);
                 performer.execute(byte);
-                self.state = State::Ground
+                self.state = State::Ground;
             },
             0x1B => {
                 self.osc_end(performer, byte);
                 self.reset_params();
-                self.state = State::Escape
+                self.state = State::Escape;
             },
             0x3B => {
                 if self.osc_num_params == 0 && !self.osc_discard {
@@ -462,7 +524,7 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
             .position(|&b| b < 0x20 || (!self.osc_discard && b == b';'))
             .unwrap_or(bytes.len());
         if run > 0 && !self.osc_discard {
-            self.osc_raw.extend_from_slice(&bytes[..run]);
+            self.osc_append(&bytes[..run]);
         }
         if run == bytes.len() {
             return run;
@@ -499,7 +561,7 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
             byte => {
                 performer.apc_end(true);
                 performer.execute(byte);
-                self.state = State::Ground
+                self.state = State::Ground;
             },
         }
         run + 1
@@ -531,11 +593,11 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
         match byte {
             0x18 | 0x1A => {
                 performer.execute(byte);
-                self.state = State::Ground
+                self.state = State::Ground;
             },
             0x1B => {
                 self.reset_params();
-                self.state = State::Escape
+                self.state = State::Escape;
             },
             _ => (),
         }
@@ -550,7 +612,7 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
         }
         performer.csi_dispatch(self.params(), self.intermediates(), self.ignoring, byte as char);
 
-        self.state = State::Ground
+        self.state = State::Ground;
     }
 
     #[inline]
@@ -604,7 +666,7 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
         } else {
             // Continue collecting bytes into param.
             self.param = self.param.saturating_mul(10);
-            self.param = self.param.saturating_add((byte - b'0') as u16);
+            self.param = self.param.saturating_add(u16::from(byte - b'0'));
         }
     }
 
@@ -624,7 +686,24 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
 
     #[inline(always)]
     fn action_osc_put(&mut self, byte: u8) {
-        self.osc_raw.push(byte);
+        self.osc_append(&[byte]);
+    }
+
+    /// Append `bytes` to the OSC body, or discard the body if it would exceed [`MAX_OSC_LEN`].
+    ///
+    /// A discarded body is dropped at once and the rest of the command is skipped like one that
+    /// [`Perform::osc_capture`] rejected: framing still runs, but nothing is dispatched.
+    #[inline]
+    fn osc_append(&mut self, bytes: &[u8]) {
+        // `osc_raw` never holds more than `MAX_OSC_LEN` bytes, so the subtraction cannot wrap.
+        if bytes.len() > MAX_OSC_LEN - self.osc_raw.len() {
+            self.osc_discard = true;
+            self.osc_num_params = 0;
+            self.osc_raw.clear();
+            self.osc_raw.shrink_to(OSC_RETAINED_CAPACITY);
+        } else {
+            self.osc_raw.extend_from_slice(bytes);
+        }
     }
 
     fn osc_end<P: Perform>(&mut self, performer: &mut P, byte: u8) {
@@ -633,6 +712,9 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
             self.osc_dispatch(performer, byte);
         }
         self.osc_raw.clear();
+        if self.osc_raw.capacity() > OSC_RETAINED_CAPACITY {
+            self.osc_raw.shrink_to(OSC_RETAINED_CAPACITY);
+        }
         self.osc_num_params = 0;
     }
 
@@ -646,9 +728,9 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
         self.params.clear();
     }
 
-    /// Separate method for osc_dispatch that borrows self as read-only
+    /// Separate method for `osc_dispatch` that borrows self as read-only
     ///
-    /// The aliasing is needed here for multiple slices into self.osc_raw
+    /// The aliasing is needed here for multiple slices into `self.osc_raw`
     #[inline]
     fn osc_dispatch<P: Perform>(&self, performer: &mut P, byte: u8) {
         let mut slices: [&[u8]; MAX_OSC_PARAMS] = [&[]; MAX_OSC_PARAMS];
@@ -826,6 +908,19 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
     }
 }
 
+/// Shows the parser state, not the OSC body it is buffering, which can be megabytes of
+/// clipboard data.
+impl<const OSC_RAW_BUF_SIZE: usize> fmt::Debug for Parser<OSC_RAW_BUF_SIZE> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Parser")
+            .field("state", &self.state)
+            .field("params", &self.params)
+            .field("intermediates", &self.intermediates())
+            .field("osc_len", &self.osc_raw.len())
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(PartialEq, Eq, Debug, Default, Copy, Clone)]
 enum State {
     CsiEntry,
@@ -873,8 +968,9 @@ pub trait Perform {
 
     /// Decide whether to capture an OSC body after its command separator.
     ///
-    /// Returning false discards its body and suppresses `osc_dispatch`, while
-    /// preserving framing and control handling. The default captures every command.
+    /// `command` is the OSC's first parameter, called when the first `;` arrives. Returning
+    /// false discards the body and suppresses [`Self::osc_dispatch`], while preserving framing
+    /// and control handling. The default captures every command.
     fn osc_capture(&mut self, _command: &[u8]) -> bool {
         true
     }
@@ -906,6 +1002,14 @@ pub trait Perform {
     fn unhook(&mut self) {}
 
     /// Dispatch an operating system command.
+    ///
+    /// `params` are the command's `;`-separated parameters; the first is the command number.
+    /// Only the first sixteen parameters are reported; any after them are dropped.
+    /// `bell_terminated` is `true` when BEL ended the command and `false` for `ESC \`.
+    ///
+    /// A command is dispatched only if its body, without separators, is at most 8 MiB. A longer
+    /// body is discarded as it arrives and never dispatched, so input that never terminates an
+    /// OSC cannot grow the parser without bound.
     fn osc_dispatch(&mut self, _params: &[&[u8]], _bell_terminated: bool) {}
 
     /// An application program command (`ESC _`) has started.
@@ -963,8 +1067,6 @@ pub trait Perform {
 
 #[cfg(test)]
 mod tests {
-    use std::vec::Vec;
-
     use super::*;
 
     const OSC_BYTES: &[u8] = &[
@@ -1001,7 +1103,7 @@ mod tests {
         }
 
         fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], ignore: bool, c: char) {
-            let params = params.iter().map(|subparam| subparam.to_vec()).collect();
+            let params = params.iter().map(<[u16]>::to_vec).collect();
             let intermediates = intermediates.to_vec();
             self.dispatched.push(Sequence::Csi(params, intermediates, ignore, c));
         }
@@ -1012,7 +1114,7 @@ mod tests {
         }
 
         fn hook(&mut self, params: &Params, intermediates: &[u8], ignore: bool, c: char) {
-            let params = params.iter().map(|subparam| subparam.to_vec()).collect();
+            let params = params.iter().map(<[u16]>::to_vec).collect();
             let intermediates = intermediates.to_vec();
             self.dispatched.push(Sequence::DcsHook(params, intermediates, ignore, c));
         }
@@ -1071,13 +1173,67 @@ mod tests {
         let mut sink = Sink::default();
         parser.advance(&mut sink, b"\x1b]6;");
         let capacity = parser.osc_raw.capacity();
+        let chunk = vec![b'x'; 65536];
         for _ in 0..16 {
-            parser.advance(&mut sink, &[b'x'; 65536]);
+            parser.advance(&mut sink, &chunk);
         }
         assert_eq!(parser.osc_raw.capacity(), capacity);
         parser.advance(&mut sink, b";tail\x07ok\x1b]2;title\x1b\\end");
         assert_eq!(sink.commands, 1);
         assert_eq!(sink.text, "okend");
+    }
+
+    /// An OSC that never ends must not grow the parser past the limit, and the parser must
+    /// recover for the next command.
+    #[test]
+    #[cfg_attr(miri, ignore = "feeds 16 MiB, which is too slow under Miri")]
+    fn osc_bodies_are_bounded() {
+        #[derive(Default)]
+        struct Sink {
+            body_lens: Vec<usize>,
+            text: String,
+        }
+        impl Perform for Sink {
+            fn print(&mut self, c: char) {
+                self.text.push(c);
+            }
+            fn osc_dispatch(&mut self, params: &[&[u8]], _: bool) {
+                self.body_lens.push(params.iter().map(|param| param.len()).sum());
+            }
+        }
+        // Feeds an OSC 52 whose body, "52" and "c" included, is `len` bytes long.
+        fn feed_clipboard(parser: &mut Parser, sink: &mut Sink, len: usize) {
+            parser.advance(sink, b"\x1b]52;c;");
+            for chunk in vec![b'A'; len - 3].chunks(65536) {
+                parser.advance(sink, chunk);
+            }
+        }
+
+        let mut parser = Parser::default();
+        let mut sink = Sink::default();
+
+        feed_clipboard(&mut parser, &mut sink, MAX_OSC_LEN);
+        parser.advance(&mut sink, b"\x07");
+        assert_eq!(sink.body_lens, [MAX_OSC_LEN], "a body at the limit is dispatched");
+        assert!(
+            parser.osc_raw.capacity() <= OSC_RETAINED_CAPACITY,
+            "the capacity a large body needed is handed back"
+        );
+
+        feed_clipboard(&mut parser, &mut sink, MAX_OSC_LEN + 1);
+        assert!(
+            parser.osc_raw.capacity() <= OSC_RETAINED_CAPACITY,
+            "a body past the limit is dropped as it arrives"
+        );
+        let chunk = vec![b'A'; 65536];
+        for _ in 0..16 {
+            parser.advance(&mut sink, &chunk);
+        }
+        assert!(parser.osc_raw.capacity() <= OSC_RETAINED_CAPACITY, "and stays dropped");
+
+        parser.advance(&mut sink, b"\x07ok\x1b]2;title\x1b\\");
+        assert_eq!(sink.body_lens, [MAX_OSC_LEN, 6], "only the next command is dispatched");
+        assert_eq!(sink.text, "ok");
     }
 
     #[test]
@@ -1160,7 +1316,7 @@ mod tests {
     #[test]
     fn parse_osc_max_params() {
         let params = ";".repeat(params::MAX_PARAMS + 1);
-        let input = format!("\x1b]{}\x1b", &params[..]).into_bytes();
+        let input = format!("\x1b]{}\x1b", &*params).into_bytes();
         let mut dispatcher = Dispatcher::default();
         let mut parser: Parser = Parser::default();
 
@@ -1277,7 +1433,7 @@ mod tests {
         // The length is MAX_PARAMS - 1 because the last semicolon is interpreted
         // as an implicit zero, making the total number of parameters MAX_PARAMS
         let params = "1;".repeat(params::MAX_PARAMS - 1);
-        let input = format!("\x1b[{}p", &params[..]).into_bytes();
+        let input = format!("\x1b[{}p", &*params).into_bytes();
 
         let mut dispatcher = Dispatcher::default();
         let mut parser: Parser = Parser::default();
@@ -1300,7 +1456,7 @@ mod tests {
         // The length is MAX_PARAMS because the last semicolon is interpreted
         // as an implicit zero, making the total number of parameters MAX_PARAMS + 1
         let params = "1;".repeat(params::MAX_PARAMS);
-        let input = format!("\x1b[{}p", &params[..]).into_bytes();
+        let input = format!("\x1b[{}p", &*params).into_bytes();
 
         let mut dispatcher = Dispatcher::default();
         let mut parser: Parser = Parser::default();
@@ -1403,7 +1559,7 @@ mod tests {
     #[test]
     fn parse_dcs_max_params() {
         let params = "1;".repeat(params::MAX_PARAMS + 1);
-        let input = format!("\x1bP{}p", &params[..]).into_bytes();
+        let input = format!("\x1bP{}p", &*params).into_bytes();
         let mut dispatcher = Dispatcher::default();
         let mut parser: Parser = Parser::default();
 
