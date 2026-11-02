@@ -752,6 +752,50 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
     /// using SIMD search with [`memchr`].
     #[inline]
     fn advance_ground<P: Perform>(&mut self, performer: &mut P, bytes: &[u8]) -> usize {
+        // Fast path: printable ASCII runs and C0 controls need no UTF-8 decoding. A run that
+        // ends at DEL or a non-ASCII byte goes to the general path with the bytes after it, so
+        // mixed text still reaches the performer as one run.
+        let mut start = 0;
+        loop {
+            let end = start + printable_ascii_prefix(&bytes[start..]);
+            let Some(&byte) = bytes.get(end) else {
+                // SAFETY: `printable_ascii_prefix` returned a run of bytes in 0x20..=0x7E.
+                unsafe { Self::print_ascii(performer, &bytes[start..end]) };
+                return end;
+            };
+            if byte >= 0x7F {
+                break;
+            }
+            // SAFETY: as above.
+            unsafe { Self::print_ascii(performer, &bytes[start..end]) };
+            if byte == 0x1B {
+                self.state = State::Escape;
+                self.reset_params();
+                return end + 1;
+            }
+            performer.execute(byte);
+            start = end + 1;
+        }
+        start + self.advance_ground_general(performer, &bytes[start..])
+    }
+
+    /// Print a run of printable ASCII, if it is not empty.
+    ///
+    /// # Safety
+    ///
+    /// Every byte of `run` must be ASCII, so that the run is valid UTF-8.
+    #[inline]
+    unsafe fn print_ascii<P: Perform>(performer: &mut P, run: &[u8]) {
+        debug_assert!(run.is_ascii());
+        if !run.is_empty() {
+            // SAFETY: the caller guarantees ASCII, which is valid UTF-8.
+            performer.print_str(unsafe { str::from_utf8_unchecked(run) });
+        }
+    }
+
+    /// Advance ground over text that may contain UTF-8, up to and including the next ESC.
+    #[inline]
+    fn advance_ground_general<P: Perform>(&mut self, performer: &mut P, bytes: &[u8]) -> usize {
         // Find the next escape character.
         let num_bytes = bytes.len();
         let plain_chars = memchr::memchr(0x1B, bytes).unwrap_or(num_bytes);
@@ -906,6 +950,29 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
             performer.print_str(&text[start..]);
         }
     }
+}
+
+/// Bytes checked per block by [`printable_ascii_prefix`].
+///
+/// Sixteen bytes is one NEON/SSE2 register, so the block test compiles to a compare and a
+/// horizontal reduction. Runs shorter than a block fall through to the scalar tail.
+const SCAN_BLOCK: usize = 16;
+
+/// Length of the leading run of printable ASCII (`0x20..=0x7E`).
+///
+/// Each block is classified with a branch-free reduction that LLVM vectorizes; only the block
+/// that holds the stop byte is searched one byte at a time.
+#[inline]
+fn printable_ascii_prefix(bytes: &[u8]) -> usize {
+    let is_stop = |b: u8| b.wrapping_sub(0x20) >= 0x5F;
+    let mut offset = 0;
+    for block in bytes.as_chunks::<SCAN_BLOCK>().0 {
+        if block.iter().fold(false, |stop, &b| stop | is_stop(b)) {
+            break;
+        }
+        offset += SCAN_BLOCK;
+    }
+    offset + bytes[offset..].iter().position(|&b| is_stop(b)).unwrap_or(bytes.len() - offset)
 }
 
 /// Shows the parser state, not the OSC body it is buffering, which can be megabytes of
@@ -1264,6 +1331,10 @@ mod tests {
             b"a\xf0\x9f\x1b[31mx\xff\x80",
             b"\x1b[1;2\x18abc\x1b[?2026habc\x1b[?2026l",
             b"\x1b]6;ignored;body\x07ok\x1b_Ga=t;AAAA\x1b\\end",
+            // Runs that cross the printable-ASCII scanner's 16-byte blocks and stop on each
+            // kind of byte it hands elsewhere: C0, DEL, ESC, and non-ASCII.
+            b"0123456789abcdef0123456789abcde\n0123456789abcdef\x7f0123456789abcdefg\x1b[mtail",
+            "0123456789abcdef\t~\u{7f}0123456789abcde\u{e9}0123456789abcdef".as_bytes(),
         ];
         for input in inputs {
             let mut expected = Dispatcher::default();
