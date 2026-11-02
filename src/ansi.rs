@@ -19,6 +19,13 @@
 //! replays them in order when the update ends: at ESU, when the held bytes would reach 2 MiB, or
 //! when the caller calls [`Processor::stop_sync`].
 //!
+//! A processor made with [`Processor::with_unbuffered_sync`] holds nothing: it dispatches every
+//! byte as it arrives and only reports the update, through [`Handler::set_private_mode`] at BSU
+//! and [`Handler::unset_private_mode`] when it ends. The handler then decides what not to
+//! present in between. Such an update cannot be extended: a BSU inside it leaves its deadline
+//! where it was, so nothing a program sends can keep the screen from being presented for more
+//! than 150 ms at a time.
+//!
 //! The processor never ends an update because time has passed. At each BSU it calls
 //! [`Timeout::set_timeout`] with a 150 ms deadline, and **the caller must check that deadline and
 //! call [`Processor::stop_sync`] once it has passed** — with the default [`StdSyncHandler`],
@@ -277,6 +284,9 @@ struct SyncState<T: Timeout> {
 
     /// Bytes read during the synchronized update.
     buffer: Vec<u8>,
+
+    /// Whether bytes inside a synchronized update are held until it ends.
+    buffered: bool,
 }
 
 impl<T: Timeout> Default for SyncState<T> {
@@ -284,7 +294,7 @@ impl<T: Timeout> Default for SyncState<T> {
         // Grown on the first synchronized update rather than reserved up front; `advance_sync`
         // bounds it against `SYNC_BUFFER_SIZE` explicitly, so the reservation bought nothing but
         // 2MiB per pane.
-        Self { buffer: Vec::new(), timeout: Default::default() }
+        Self { buffer: Vec::new(), timeout: Default::default(), buffered: true }
     }
 }
 
@@ -348,6 +358,7 @@ impl<T: Timeout + fmt::Debug> fmt::Debug for Processor<T> {
             .field("preceding_char", &self.state.preceding_char)
             .field("sync_timeout", &self.state.sync_state.timeout)
             .field("sync_bytes", &self.state.sync_state.buffer.len())
+            .field("sync_buffered", &self.state.sync_state.buffered)
             .finish()
     }
 }
@@ -358,6 +369,58 @@ impl<T: Timeout> Processor<T> {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Creates a processor that dispatches a synchronized update's bytes as they arrive.
+    ///
+    /// A processor from [`Self::new`] holds them until the update ends and replays them then,
+    /// so a terminal parses a whole repaint at once. This one parses them immediately and only
+    /// reports the update's start and end to the [`Handler`], which must not present the screen
+    /// in between. See the [module documentation](crate::ansi#synchronized-updates).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use vvte::ansi::{Handler, NamedPrivateMode, PrivateMode, Processor};
+    ///
+    /// #[derive(Default)]
+    /// struct Screen {
+    ///     text: String,
+    ///     synchronized: bool,
+    /// }
+    ///
+    /// impl Handler for Screen {
+    ///     fn input(&mut self, c: char) {
+    ///         self.text.push(c);
+    ///     }
+    ///
+    ///     fn set_private_mode(&mut self, mode: PrivateMode) {
+    ///         if mode == PrivateMode::Named(NamedPrivateMode::SyncUpdate) {
+    ///             self.synchronized = true;
+    ///         }
+    ///     }
+    ///
+    ///     fn unset_private_mode(&mut self, mode: PrivateMode) {
+    ///         if mode == PrivateMode::Named(NamedPrivateMode::SyncUpdate) {
+    ///             self.synchronized = false;
+    ///         }
+    ///     }
+    /// }
+    ///
+    /// let mut processor: Processor = Processor::with_unbuffered_sync();
+    /// let mut screen = Screen::default();
+    /// processor.advance(&mut screen, b"\x1b[?2026hdrawn");
+    /// assert_eq!(screen.text, "drawn", "the update's bytes are dispatched at once");
+    /// assert!(screen.synchronized, "but the screen knows not to present them yet");
+    ///
+    /// processor.advance(&mut screen, b"\x1b[?2026l");
+    /// assert!(!screen.synchronized);
+    /// ```
+    #[must_use]
+    pub fn with_unbuffered_sync() -> Self {
+        let mut processor = Self::default();
+        processor.state.sync_state.buffered = false;
+        processor
     }
 
     /// Returns the synchronized-update deadline tracker.
@@ -371,7 +434,8 @@ impl<T: Timeout> Processor<T> {
     /// Parses `bytes` and dispatches the resulting operations to `handler`.
     ///
     /// Like [`Parser::advance`](crate::Parser::advance), `bytes` can end anywhere. While a
-    /// synchronized update is pending, bytes are held instead of dispatched; see the
+    /// synchronized update is pending, bytes are held instead of dispatched, unless the
+    /// processor came from [`Self::with_unbuffered_sync`]; see the
     /// [module documentation](crate::ansi#synchronized-updates).
     #[inline]
     pub fn advance<H>(&mut self, handler: &mut H, bytes: &[u8])
@@ -380,7 +444,7 @@ impl<T: Timeout> Processor<T> {
     {
         let mut processed = 0;
         while processed != bytes.len() {
-            if self.state.sync_state.timeout.pending_timeout() {
+            if self.state.sync_state.buffered && self.state.sync_state.timeout.pending_timeout() {
                 processed += self.advance_sync(handler, &bytes[processed..]);
             } else {
                 let mut performer = Performer::new(&mut self.state, handler);
@@ -574,9 +638,9 @@ pub trait Timeout: Default {
     /// Returns whether a synchronized update is pending.
     ///
     /// This must stay `true` from [`Self::set_timeout`] until [`Self::clear_timeout`], even
-    /// after the deadline has passed. While it is `true`, [`Processor::advance`] holds input
-    /// instead of dispatching it; returning `false` early would let new output overtake the
-    /// bytes still held.
+    /// after the deadline has passed. While it is `true`, a buffered [`Processor::advance`]
+    /// holds input instead of dispatching it; returning `false` early would let new output
+    /// overtake the bytes still held.
     fn pending_timeout(&self) -> bool;
 }
 
@@ -1769,8 +1833,14 @@ where
                 for param in params_iter.map(|param| param[0]) {
                     // Handle sync updates opaquely.
                     if param == NamedPrivateMode::SyncUpdate as u16 {
-                        self.state.sync_state.timeout.set_timeout(SYNC_UPDATE_TIMEOUT);
-                        self.terminated = true;
+                        let sync = &mut self.state.sync_state;
+                        // A buffered update holds bytes, so its size bounds it. An unbuffered
+                        // one holds only presentation, so its first deadline must stand.
+                        if sync.buffered || !sync.timeout.pending_timeout() {
+                            sync.timeout.set_timeout(SYNC_UPDATE_TIMEOUT);
+                        }
+                        // Stop here so that `Processor::advance` starts holding bytes.
+                        self.terminated |= sync.buffered;
                     }
 
                     handler.set_private_mode(PrivateMode::new(param));
@@ -1812,6 +1882,12 @@ where
             },
             ('l', [b'?']) => {
                 for param in params_iter.map(|param| param[0]) {
+                    // A buffered update ends in `Processor::stop_sync_internal`, which may
+                    // replay this ESU after a later BSU has already started the next update.
+                    let sync = &mut self.state.sync_state;
+                    if !sync.buffered && param == NamedPrivateMode::SyncUpdate as u16 {
+                        sync.timeout.clear_timeout();
+                    }
                     handler.unset_private_mode(PrivateMode::new(param));
                 }
             },
@@ -2527,6 +2603,117 @@ mod tests {
 
         parser.advance(&mut handler, b"\x1b[?2026l");
         assert_eq!(handler.events, ["goto 2 3", "apc:Gi=1;QUJD end", "goto 4 5"]);
+    }
+
+    /// Records what an unbuffered synchronized update dispatches, in order.
+    #[derive(Default)]
+    struct SyncRecorder(Vec<String>);
+
+    impl Handler for SyncRecorder {
+        fn input(&mut self, c: char) {
+            match self.0.last_mut() {
+                Some(last) if last.starts_with('"') => last.push(c),
+                _ => self.0.push(format!("\"{c}")),
+            }
+        }
+
+        fn goto(&mut self, line: i32, col: usize) {
+            self.0.push(format!("goto {line} {col}"));
+        }
+
+        fn set_private_mode(&mut self, mode: PrivateMode) {
+            self.0.push(format!("set {mode:?}"));
+        }
+
+        fn unset_private_mode(&mut self, mode: PrivateMode) {
+            self.0.push(format!("unset {mode:?}"));
+        }
+
+        fn apc_start(&mut self) {
+            self.0.push("apc:".into());
+        }
+
+        fn apc_put(&mut self, bytes: &[u8]) {
+            self.0.last_mut().unwrap().push_str(str::from_utf8(bytes).unwrap());
+        }
+
+        fn apc_end(&mut self, _: bool) {
+            self.0.last_mut().unwrap().push_str(" end");
+        }
+    }
+
+    const SYNC: &str = "set Named(SyncUpdate)";
+    const UNSYNC: &str = "unset Named(SyncUpdate)";
+
+    #[test]
+    fn unbuffered_sync_dispatches_at_once_and_reports_its_bounds() {
+        let mut parser = Processor::<TestSyncHandler>::with_unbuffered_sync();
+        let mut handler = SyncRecorder::default();
+
+        parser.advance(&mut handler, b"\x1b[?2026h\x1b[3;4Hab\x1b_Gi=1;QU");
+        assert!(parser.state.sync_state.timeout.pending_timeout());
+        assert_eq!(handler.0, [SYNC, "goto 2 3", "\"ab", "apc:Gi=1;QU"]);
+
+        parser.advance(&mut handler, b"JD\x1b\\\x1b[?2026lc");
+        assert!(!parser.state.sync_state.timeout.pending_timeout());
+        assert_eq!(parser.sync_bytes_count(), 0);
+        assert_eq!(handler.0, [SYNC, "goto 2 3", "\"ab", "apc:Gi=1;QUJD end", UNSYNC, "\"c"]);
+    }
+
+    #[test]
+    fn unbuffered_sync_keeps_its_first_deadline() {
+        let mut parser = Processor::<TestSyncHandler>::with_unbuffered_sync();
+        let mut handler = SyncRecorder::default();
+
+        parser.advance(&mut handler, b"\x1b[?2026ha\x1b[?2026hb\x1b[?2026h");
+        assert_eq!(parser.state.sync_state.timeout.is_sync, 1, "a BSU inside must not extend it");
+
+        parser.advance(&mut handler, b"\x1b[?2026l\x1b[?2026h");
+        assert_eq!(parser.state.sync_state.timeout.is_sync, 1, "the next update starts afresh");
+    }
+
+    #[test]
+    fn unbuffered_sync_ends_at_stop_sync() {
+        let mut parser = Processor::<TestSyncHandler>::with_unbuffered_sync();
+        let mut handler = SyncRecorder::default();
+
+        parser.advance(&mut handler, b"\x1b[?2026hab");
+        parser.stop_sync(&mut handler);
+        assert!(!parser.state.sync_state.timeout.pending_timeout());
+        parser.advance(&mut handler, b"c\x1b[?2026l");
+        assert_eq!(handler.0, [SYNC, "\"ab", UNSYNC, "\"c", UNSYNC]);
+    }
+
+    #[test]
+    fn unbuffered_sync_bulk_and_byte_feeds_match() {
+        let input = b"x\x1b[?2026h\x1b[1;2Hab\x1b_Gi=1;QUJD\x1b\\\x1b[?2026hcd\x1b[?2026ley";
+        let mut bulk = SyncRecorder::default();
+        Processor::<TestSyncHandler>::with_unbuffered_sync().advance(&mut bulk, input);
+
+        let mut bytewise = SyncRecorder::default();
+        let mut parser = Processor::<TestSyncHandler>::with_unbuffered_sync();
+        for byte in input {
+            parser.advance(&mut bytewise, &[*byte]);
+        }
+        assert_eq!(bulk.0, bytewise.0);
+        assert!(!parser.state.sync_state.timeout.pending_timeout());
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "feeds 4 MiB, which is too slow under Miri")]
+    fn unbuffered_sync_holds_nothing_past_the_buffer_limit() {
+        let mut parser = Processor::<TestSyncHandler>::with_unbuffered_sync();
+        let mut handler = SyncRecorder::default();
+
+        parser.advance(&mut handler, b"\x1b[?2026h");
+        parser.advance(&mut handler, "a".repeat(2 * SYNC_BUFFER_SIZE).as_bytes());
+        assert_eq!(parser.state.sync_state.buffer.capacity(), 0);
+        assert!(
+            parser.state.sync_state.timeout.pending_timeout(),
+            "only ESU or the deadline ends it"
+        );
+        assert_eq!(handler.0.len(), 2);
+        assert_eq!(handler.0[1].len(), 1 + 2 * SYNC_BUFFER_SIZE);
     }
 
     #[test]
