@@ -2,40 +2,13 @@
 
 Terminal stream parser for [Vivido](https://github.com/vivido-dev/vivido) and related projects.
 
-`vvte` is a fork of [`vte` 0.15.0](https://crates.io/crates/vte) (upstream revision
-`3b3da71c34cc1256c7e20981cf03f8eb95e08ffc`). [`Parser`] implements Paul Williams's
-[ANSI parser state machine](https://vt100.net/emu/dec_ansi_parser): it handles the bookkeeping of
-parsing a byte stream into control actions, while your implementation of the [`Perform`] trait
-decides what those actions mean. The parser assigns no semantics of its own, so it can sit under
-any terminal emulator or stream consumer.
+[`Parser`] implements Paul Williams's [ANSI parser state machine](https://vt100.net/emu/dec_ansi_parser):
+it handles the bookkeeping of parsing a byte stream into control actions, while your implementation
+of the [`Perform`] trait decides what those actions mean. The parser assigns no semantics of its own,
+so it can sit under any terminal emulator or stream consumer.
 
-Like upstream, it supports UTF-8 input, allows OSC strings to be terminated by `0x07` as well as
-the canonical terminator, and only supports 7-bit codes.
-
-## Why the fork
-
-`vvte` keeps the upstream parser and API, with four changes that matter for Vivido's use as a
-long-lived GPU terminal:
-
-- **Growable OSC buffer.** Upstream reserves a fixed 2 MiB inline array for OSC/DCS payloads in
-  every parser. Here the payload lives in a heap `Vec` that grows on demand up to 8 MiB, enough
-  for large OSC 52 clipboard writes; a longer body is discarded as it arrives and never
-  dispatched, so output that never terminates an OSC cannot exhaust memory. The
-  `Parser::<OSC_RAW_BUF_SIZE>` const parameter remains for API compatibility but has no effect.
-- **Bulk OSC handling.** The advance loop leaves the per-byte dispatch for OSC runs and appends
-  payloads in bulk, which shortens the hot path for the large in-band sequences Vivido terminals
-  process.
-- **APC dispatch.** Upstream discards application program commands (`ESC _ … ESC \`). Here
-  `Perform::apc_start`, `apc_put` and `apc_end` deliver them, with the data handed over in whole
-  runs rather than a byte at a time, since an APC is how the Kitty graphics protocol carries
-  megabytes of image data. A command counts as complete only when `ESC \` closes it; CAN, SUB or
-  the start of another escape sequence cancel it. SOS and PM strings are still ignored.
-- **Debug-gated diagnostics.** Unhandled sequences are logged at debug level as named events
-  (`event = "vvte.<kind>.<state>"`) with their payload in key-value fields, never in the message.
-  Nothing is formatted unless debug logging is enabled, and nothing is logged per DCS byte or
-  per color operation.
-
-Upstream's `no_std` support is dropped; the parser requires `std`.
+It supports UTF-8 input, allows OSC strings to be terminated by `0x07` as well as the canonical
+terminator, and only supports 7-bit codes.
 
 ## Features
 
@@ -73,8 +46,14 @@ Feed arbitrary chunks to `Parser::advance`; UTF-8 sequences split across chunk b
 reassembled internally. Implement only the callbacks you care about — every [`Perform`] method has
 a no-op default.
 
-[`Parser`]: https://docs.rs/vvte/latest/vvte/struct.Parser.html
-[`Perform`]: https://docs.rs/vvte/latest/vvte/trait.Perform.html
+## Batched text and selective OSC capture
+
+`Perform::print_str` and `ansi::Handler::input_str` have scalar defaults. Optimized handlers can
+consume borrowed printable runs without changing existing consumers. CSI parameters are consumed
+in spans. The opt-in `Perform::osc_capture` hook can reject an OSC body after its command
+separator; framing still runs, but rejected bodies are neither retained nor dispatched. The ANSI
+adapter uses this for unsupported commands when debug logging is off. Split UTF-8 C1 controls now
+dispatch identically to complete input chunks.
 
 ## License
 
@@ -82,12 +61,5 @@ Licensed under either of [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT) at y
 
 Derived from `vte` 0.15.0; `src/ansi.rs` retains its upstream Apache-2.0 license notice.
 
-## Batched text and selective OSC capture
-
-Version 0.15.3 adds `Perform::print_str` and `ansi::Handler::input_str` with
-scalar defaults. Optimized handlers can consume borrowed printable runs without
-changing existing consumers. CSI parameters are consumed in spans. The opt-in
-`Perform::osc_capture` hook can reject an OSC body after its command separator;
-framing still runs, but rejected bodies are neither retained nor dispatched.
-The ANSI adapter uses this for unsupported commands when debug logging is off.
-Split UTF-8 C1 controls now dispatch identically to complete input chunks.
+[`Parser`]: https://docs.rs/vvte/latest/vvte/struct.Parser.html
+[`Perform`]: https://docs.rs/vvte/latest/vvte/trait.Perform.html
