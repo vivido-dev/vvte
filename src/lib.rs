@@ -952,27 +952,37 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
     }
 }
 
-/// Bytes checked per block by [`printable_ascii_prefix`].
-///
-/// Sixteen bytes is one NEON/SSE2 register, so the block test compiles to a compare and a
-/// horizontal reduction. Runs shorter than a block fall through to the scalar tail.
-const SCAN_BLOCK: usize = 16;
-
 /// Length of the leading run of printable ASCII (`0x20..=0x7E`).
 ///
-/// Each block is classified with a branch-free reduction that LLVM vectorizes; only the block
-/// that holds the stop byte is searched one byte at a time.
+/// Tests eight bytes per step with word arithmetic and finds the first stop byte in the word from
+/// its trailing zeros, so no byte is looked at twice. Output is mostly short lines, so most stops
+/// are found in the step that reaches them.
 #[inline]
 fn printable_ascii_prefix(bytes: &[u8]) -> usize {
-    let is_stop = |b: u8| b.wrapping_sub(0x20) >= 0x5F;
+    /// Every byte's low seven bits.
+    const LOW7: u64 = 0x7F7F_7F7F_7F7F_7F7F;
+    /// Every byte's high bit.
+    const HIGH: u64 = 0x8080_8080_8080_8080;
+    /// Added to `LOW7` bytes, sets the high bit exactly for 0x7F.
+    const DEL: u64 = 0x0101_0101_0101_0101;
+    /// Added to `LOW7` bytes, sets the high bit exactly for 0x20 and above.
+    const SPACE: u64 = 0x6060_6060_6060_6060;
+
     let mut offset = 0;
-    for block in bytes.as_chunks::<SCAN_BLOCK>().0 {
-        if block.iter().fold(false, |stop, &b| stop | is_stop(b)) {
-            break;
+    for word in bytes.as_chunks::<8>().0 {
+        let word = u64::from_le_bytes(*word);
+        let low = word & LOW7;
+        // No byte carries into the next: `low` bytes are at most 0x7F, and 0x7F + 0x60 = 0xDF.
+        let high_or_del = (word | (low + DEL)) & HIGH;
+        let control = !(low + SPACE) & HIGH;
+        let stops = high_or_del | control;
+        if stops != 0 {
+            return offset + (stops.trailing_zeros() / 8) as usize;
         }
-        offset += SCAN_BLOCK;
+        offset += 8;
     }
-    offset + bytes[offset..].iter().position(|&b| is_stop(b)).unwrap_or(bytes.len() - offset)
+    let is_stop = |b: &u8| b.wrapping_sub(0x20) >= 0x5F;
+    offset + bytes[offset..].iter().position(is_stop).unwrap_or(bytes.len() - offset)
 }
 
 /// Shows the parser state, not the OSC body it is buffering, which can be megabytes of
@@ -1135,6 +1145,26 @@ pub trait Perform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_printable_prefix_stops_at_every_kind_of_stop_byte_in_every_position() {
+        let scalar = |bytes: &[u8]| bytes.iter().take_while(|b| (0x20..=0x7E).contains(*b)).count();
+        for stop in (0..=0xFF_u8).filter(|b| !(0x20..=0x7E).contains(b)) {
+            for at in 0..20 {
+                let mut bytes = vec![b'a'; 20];
+                bytes[at] = stop;
+                assert_eq!(printable_ascii_prefix(&bytes), at, "{stop:#04x} at {at}");
+            }
+        }
+        for printable in 0x20..=0x7E_u8 {
+            let bytes = vec![printable; 19];
+            assert_eq!(printable_ascii_prefix(&bytes), 19);
+        }
+        let mixed = b"ab\x7Fcd \x1Bx\xC3\xA9";
+        for start in 0..mixed.len() {
+            assert_eq!(printable_ascii_prefix(&mixed[start..]), scalar(&mixed[start..]));
+        }
+    }
 
     const OSC_BYTES: &[u8] = &[
         0x1B, 0x5D, // Begin OSC
