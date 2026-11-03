@@ -769,14 +769,58 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
             // SAFETY: as above.
             unsafe { Self::print_ascii(performer, &bytes[start..end]) };
             if byte == 0x1B {
-                self.state = State::Escape;
-                self.reset_params();
-                return end + 1;
+                return end + 1 + self.enter_escape(performer, &bytes[end + 1..]);
             }
             performer.execute(byte);
             start = end + 1;
         }
         start + self.advance_ground_general(performer, &bytes[start..])
+    }
+
+    /// Enter the escape state after an ESC in ground, given the bytes that follow it; returns how
+    /// many of them were consumed.
+    ///
+    /// A complete ordinary CSI (`[`, an optional private marker, digits, `;` and `:`, and a final
+    /// byte) is parsed and dispatched here in one pass, which is what the state machine would do
+    /// one byte per step. Anything else (intermediates, controls, a full parameter list, or a
+    /// sequence cut off by the end of `bytes`) consumes nothing and is left to the state machine,
+    /// so the actions never depend on where reads split.
+    #[inline]
+    fn enter_escape<P: Perform>(&mut self, performer: &mut P, bytes: &[u8]) -> usize {
+        self.state = State::Escape;
+        self.reset_params();
+        let [b'[', rest @ ..] = bytes else { return 0 };
+        let mut index = 0;
+        if let Some(&marker @ 0x3C..=0x3F) = rest.first() {
+            self.action_collect(marker);
+            index = 1;
+        }
+        let mut param = 0u16;
+        while let Some(&byte) = rest.get(index) {
+            index += 1;
+            match byte {
+                b'0'..=b'9' if !self.params.is_full() => {
+                    param = param.saturating_mul(10).saturating_add(u16::from(byte - b'0'));
+                },
+                b';' if !self.params.is_full() => {
+                    self.params.push(param);
+                    param = 0;
+                },
+                b':' if !self.params.is_full() => {
+                    self.params.extend(param);
+                    param = 0;
+                },
+                0x40..=0x7E => {
+                    self.param = param;
+                    self.action_csi_dispatch(performer, byte);
+                    return 1 + index;
+                },
+                _ => break,
+            }
+        }
+        // Not handled here: start over from the escape state with nothing consumed.
+        self.reset_params();
+        0
     }
 
     /// Print a run of printable ASCII, if it is not empty.
@@ -802,9 +846,7 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
 
         // If the next character is ESC, just process it and short-circuit.
         if plain_chars == 0 {
-            self.state = State::Escape;
-            self.reset_params();
-            return 1;
+            return 1 + self.enter_escape(performer, &bytes[1..]);
         }
 
         match simdutf8::compat::from_utf8(&bytes[..plain_chars]) {
@@ -814,9 +856,7 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
 
                 // If there's another character, it must be escape so process it directly.
                 if processed < num_bytes {
-                    self.state = State::Escape;
-                    self.reset_params();
-                    processed += 1;
+                    processed += 1 + self.enter_escape(performer, &bytes[processed + 1..]);
                 }
 
                 processed
@@ -1436,6 +1476,14 @@ mod tests {
             // invalid byte after valid CJK.
             "界界界\n界\u{85}界\u{9b}x\u{a0}\u{bf}é\u{80}界界界界界界\t😀\u{9f}".as_bytes(),
             b"\xe7\x95\x8c\xc2\x85\xc2\xa0\xc3\xa9\x01\xe7\x95\x8c\xff\xe7\x95",
+            // CSI sequences the ESC transition parses whole (Kitty's "CSI codes with few chars"
+            // chunks, empty and colon parameters, private markers), and ones it must leave to
+            // the state machine: intermediates, a second marker, a control or ESC inside, DEL,
+            // and more parameters than fit.
+            b"\x1b[m\x1b[?1h\x1b[H\x1b[1;2;3;4:3;31m\x1b[38:5:24;48:2:125:136:147m\x1b[58;5;44;2m",
+            b"\x1b[m\x1b[10A\x1b[3E\x1b[2K\x1b[39m\x1b[10`a\x1b[100b\x1b[?1l\x1b[;;m\x1b[:5m",
+            "é\x1b[31mé\x1b[3 q\x1b[?1;2$p\x1b[>?c\x1b[1\n2m\x1b[1\x1b[2m\x1b[1\x7f2m\x1b[99999999m".as_bytes(),
+            b"\x1b[1;2;3;4;5;6;7;8;9;10;11;12;13;14;15;16;17;18;19;20;21;22;23;24;25;26;27;28;29;30;31;32;33m",
         ];
         for input in inputs {
             let mut expected = Dispatcher::default();

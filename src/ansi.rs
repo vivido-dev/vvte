@@ -803,6 +803,16 @@ pub trait Handler {
     /// Set a terminal attribute.
     fn terminal_attribute(&mut self, _attr: Attr) {}
 
+    /// The attributes of one SGR sequence follow, through [`Handler::terminal_attribute`], until
+    /// [`Handler::finish_attributes`].
+    ///
+    /// Lets a handler apply a sequence's attributes together, for example to resolve the
+    /// resulting style once rather than after each attribute.
+    fn start_attributes(&mut self) {}
+
+    /// The attributes announced by [`Handler::start_attributes`] are complete.
+    fn finish_attributes(&mut self) {}
+
     /// Set mode.
     fn set_mode(&mut self, _mode: Mode) {}
 
@@ -1896,7 +1906,9 @@ where
                 if params.is_empty() {
                     handler.terminal_attribute(Attr::Reset);
                 } else {
+                    handler.start_attributes();
                     attrs_from_sgr_parameters(handler, &mut params_iter);
+                    handler.finish_attributes();
                 }
             },
             ('n', []) => handler.device_status(next_param_or(0) as usize),
