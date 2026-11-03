@@ -807,7 +807,7 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
             return 1;
         }
 
-        match str::from_utf8(&bytes[..plain_chars]) {
+        match simdutf8::compat::from_utf8(&bytes[..plain_chars]) {
             Ok(parsed) => {
                 Self::ground_dispatch(performer, parsed);
                 let mut processed = plain_chars;
@@ -913,8 +913,10 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
                         performer.print(c);
                     }
 
+                    // Only the first character is consumed; later valid bytes in the buffer are
+                    // parsed again from the input.
                     self.partial_utf8_len = 0;
-                    return valid_bytes - old_bytes;
+                    return c.len_utf8() - old_bytes;
                 }
 
                 match err.error_len() {
@@ -936,20 +938,70 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
     /// Handle ground dispatch of print/execute for all characters in a string.
     #[inline]
     fn ground_dispatch<P: Perform>(performer: &mut P, text: &str) {
+        // Controls are found from bytes, without decoding characters: C0 controls are bytes
+        // below 0x20, which never occur inside a multi-byte sequence, and C1 controls
+        // (U+0080..=U+009F) are encoded as 0xC2 followed by 0x80..=0x9F.
+        let bytes = text.as_bytes();
         let mut start = 0;
-        for (offset, c) in text.char_indices() {
-            if matches!(c, '\x00'..='\x1f' | '\u{80}'..='\u{9f}') {
-                if start < offset {
-                    performer.print_str(&text[start..offset]);
+        let mut from = 0;
+        while let Some(found) = control_candidate(&bytes[from..]) {
+            let at = from + found;
+            let (control, len) = if bytes[at] < 0x20 {
+                (bytes[at], 1)
+            } else {
+                // `text` is valid UTF-8, so a 0xC2 lead byte always has a continuation byte.
+                let next = bytes[at + 1];
+                if next > 0x9F {
+                    from = at + 2;
+                    continue;
                 }
-                performer.execute(c as u8);
-                start = offset + c.len_utf8();
+                (next, 2)
+            };
+            if start < at {
+                performer.print_str(&text[start..at]);
             }
+            performer.execute(control);
+            start = at + len;
+            from = start;
         }
         if start < text.len() {
             performer.print_str(&text[start..]);
         }
     }
+}
+
+/// Position of the first byte in `bytes` that may start a control: below 0x20, or the 0xC2 lead
+/// byte of a C1 control. The caller checks a 0xC2 candidate's continuation byte.
+///
+/// Eight bytes per step with word arithmetic, like [`printable_ascii_prefix`]. The equality test
+/// can flag a byte above a true match, never below one, so the lowest flagged byte is a true
+/// candidate.
+#[inline]
+fn control_candidate(bytes: &[u8]) -> Option<usize> {
+    /// Every byte's low seven bits.
+    const LOW7: u64 = 0x7F7F_7F7F_7F7F_7F7F;
+    /// Every byte's high bit.
+    const HIGH: u64 = 0x8080_8080_8080_8080;
+    /// Added to `LOW7` bytes, sets the high bit exactly for 0x20 and above.
+    const SPACE: u64 = 0x6060_6060_6060_6060;
+    /// Every byte 0x01.
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    /// The C1 lead byte in every position.
+    const C2: u64 = 0xC2C2_C2C2_C2C2_C2C2;
+
+    let mut offset = 0;
+    for word in bytes.as_chunks::<8>().0 {
+        let word = u64::from_le_bytes(*word);
+        let c0 = !(word & LOW7).wrapping_add(SPACE) & !word & HIGH;
+        let lead = word ^ C2;
+        let c1 = lead.wrapping_sub(ONES) & !lead & HIGH;
+        let found = c0 | c1;
+        if found != 0 {
+            return Some(offset + (found.trailing_zeros() / 8) as usize);
+        }
+        offset += 8;
+    }
+    bytes[offset..].iter().position(|&b| b < 0x20 || b == 0xC2).map(|position| offset + position)
 }
 
 /// Length of the leading run of printable ASCII (`0x20..=0x7E`).
@@ -1354,6 +1406,20 @@ mod tests {
     }
 
     #[test]
+    fn a_split_character_does_not_swallow_the_byte_after_it() {
+        // `é` split after its lead byte, then `x`, then the start of another character: the
+        // completion buffer holds `é`, `x` and a partial lead, and only `é` may be consumed.
+        let mut dispatcher = Dispatcher::default();
+        let mut parser = Parser::<1024>::default();
+        parser.advance(&mut dispatcher, b"\xc3");
+        parser.advance(&mut dispatcher, b"\xa9x\xe7\x95\x8c");
+        assert_eq!(
+            dispatcher.dispatched,
+            [Sequence::Print('é'), Sequence::Print('x'), Sequence::Print('界')]
+        );
+    }
+
+    #[test]
     fn bulk_and_byte_feeds_have_identical_actions() {
         let inputs: &[&[u8]] = &[
             b"abc\tdef\r\n\x1b[1;2:3;999999999999999999mtext\x1b[0m",
@@ -1365,6 +1431,11 @@ mod tests {
             // kind of byte it hands elsewhere: C0, DEL, ESC, and non-ASCII.
             b"0123456789abcdef0123456789abcde\n0123456789abcdef\x7f0123456789abcdefg\x1b[mtail",
             "0123456789abcdef\t~\u{7f}0123456789abcde\u{e9}0123456789abcdef".as_bytes(),
+            // Multi-byte runs whose controls are found from bytes: C0 and C1 controls at word
+            // boundaries and inside words, Latin-1 text that shares C1's 0xC2 lead byte, and an
+            // invalid byte after valid CJK.
+            "界界界\n界\u{85}界\u{9b}x\u{a0}\u{bf}é\u{80}界界界界界界\t😀\u{9f}".as_bytes(),
+            b"\xe7\x95\x8c\xc2\x85\xc2\xa0\xc3\xa9\x01\xe7\x95\x8c\xff\xe7\x95",
         ];
         for input in inputs {
             let mut expected = Dispatcher::default();

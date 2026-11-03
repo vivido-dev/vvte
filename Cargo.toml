@@ -17,7 +17,7 @@ name = "vvte"
 
 [features]
 default = ["std"]
-std = ["memchr/std"]
+std = ["memchr/std", "simdutf8/std"]
 ansi = ["dep:log", "dep:cursor-icon", "dep:bitflags"]
 serde = ["dep:serde"]
 
@@ -28,6 +28,9 @@ cursor-icon = { version = "1.2", default-features = false, optional = true }
 log = { version = "0.4.29", features = ["kv"], optional = true }
 memchr = { version = "2.8", default-features = false }
 serde = { version = "1", features = ["derive"], optional = true }
+# UTF-8 validation of printable text with SIMD; std's validator walks multi-byte text one
+# character at a time, which dominated parsing CJK output.
+simdutf8 = { version = "0.1.5", default-features = false }
 
 [lints.rust]
 ambiguous_negative_literals = "warn"
